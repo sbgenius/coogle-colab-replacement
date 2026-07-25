@@ -68,13 +68,7 @@ jobs:
         run: |
           extensions=(
             ms-python.python
-            dbaeumer.vscode-eslint
-            esbenp.prettier-vscode
-            eamodio.gitlens
-            editorconfig.editorconfig
-            redhat.vscode-yaml
-            christian-kohler.path-intellisense
-            usernamehw.errorlens
+            ms-vscode.cpptools
           )
           for ext in "${extensions[@]}"; do
             code-server --install-extension "$ext" || echo "Failed to install $ext, continuing..."
