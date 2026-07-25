@@ -64,6 +64,22 @@ jobs:
           sudo mv ngrok /usr/local/bin/ngrok
           ngrok config add-authtoken "${{ github.event.inputs.ngrok_token }}"
 
+      - name: Install default extensions
+        run: |
+          extensions=(
+            ms-python.python
+            dbaeumer.vscode-eslint
+            esbenp.prettier-vscode
+            eamodio.gitlens
+            editorconfig.editorconfig
+            redhat.vscode-yaml
+            christian-kohler.path-intellisense
+            usernamehw.errorlens
+          )
+          for ext in "${extensions[@]}"; do
+            code-server --install-extension "$ext" || echo "Failed to install $ext, continuing..."
+          done
+
       - name: Configure code-server
         run: |
           mkdir -p ~/.config/code-server
@@ -125,23 +141,17 @@ jobs:
           echo " Password was set via workflow input (not printed for security)"
           echo "=================================================="
 
-      - name: Keep session alive (auto-saving work periodically)
+      - name: Keep session alive
         run: |
           minutes="${{ github.event.inputs.duration_minutes }}"
           echo "Keeping runner alive for $minutes minutes..."
-          cd "$WORK_DIR"
           end=$(( $(date +%s) + minutes * 60 ))
           while [ "$(date +%s)" -lt "$end" ]; do
             sleep 300
-            if [ -n "$(git status --porcelain)" ]; then
-              git add -A
-              git commit -m "Auto-save: $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
-              git push origin HEAD || echo "Push failed, will retry next cycle"
-            fi
             echo "$(date): still alive, tunnel: ${{ env.CODE_SERVER_URL }}"
           done
 
-      - name: Final commit and push (always runs, even if cancelled/failed)
+      - name: Commit and push changes (only save point, runs even if cancelled/failed)
         if: always()
         run: |
           cd "$WORK_DIR" || exit 0
