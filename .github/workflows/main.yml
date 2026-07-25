@@ -21,15 +21,37 @@ jobs:
     runs-on: ubuntu-latest
     env:
       WORK_DIR: /home/runner/root
-      REPO_URL: https://x-access-token:${{ secrets.ROOT_REPO_PAT }}@github.com/${{ github.repository_owner }}/root.git
+      REPO_OWNER: ${{ github.repository_owner }}
+      REPO_URL: https://github.com/${{ github.repository_owner }}/root.git
+      GH_TOKEN: ${{ secrets.ROOT_REPO_PAT }}
 
     steps:
+      - name: Validate token secret is present and working
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::ROOT_REPO_PAT secret is empty or not set. Add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "Checking token against GitHub API..."
+          http_code=$(curl -s -o /tmp/gh_check.json -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            https://api.github.com/repos/${REPO_OWNER}/root)
+          if [ "$http_code" != "200" ]; then
+            echo "::error::GitHub API check failed (HTTP $http_code). Token may be invalid, expired, or lacks access to ${REPO_OWNER}/root."
+            cat /tmp/gh_check.json
+            exit 1
+          fi
+          echo "Token OK, repo is reachable."
+
       - name: Clone private "root" repo
         run: |
-          git clone "$REPO_URL" "$WORK_DIR"
+          git clone "https://${GH_TOKEN}@github.com/${REPO_OWNER}/root.git" "$WORK_DIR"
           cd "$WORK_DIR"
           git config user.name "code-server-bot"
           git config user.email "code-server-bot@users.noreply.github.com"
+          # Store credentials for later push steps without re-embedding token in remote URL
+          git config credential.helper store
+          echo "https://${GH_TOKEN}@github.com" > ~/.git-credentials
 
       - name: Install code-server
         run: |
