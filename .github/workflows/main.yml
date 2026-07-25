@@ -1,0 +1,132 @@
+name: Code-Server on Ubuntu Runner (ngrok)
+on:
+  workflow_dispatch:
+    inputs:
+      password:
+        description: 'Password to access code-server'
+        required: true
+        type: string
+      ngrok_token:
+        description: 'Your ngrok authtoken'
+        required: true
+        type: string
+      duration_minutes:
+        description: 'How long to keep the session alive (minutes)'
+        required: false
+        default: '350'
+        type: string
+
+jobs:
+  code-server:
+    runs-on: ubuntu-latest
+    env:
+      WORK_DIR: /home/runner/root
+      REPO_URL: https://x-access-token:${{ secrets.ROOT_REPO_PAT }}@github.com/${{ github.repository_owner }}/root.git
+
+    steps:
+      - name: Clone private "root" repo
+        run: |
+          git clone "$REPO_URL" "$WORK_DIR"
+          cd "$WORK_DIR"
+          git config user.name "code-server-bot"
+          git config user.email "code-server-bot@users.noreply.github.com"
+
+      - name: Install code-server
+        run: |
+          curl -fsSL https://code-server.dev/install.sh | sh
+
+      - name: Install ngrok
+        run: |
+          curl -fsSL -o ngrok.tgz https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+          tar -xvzf ngrok.tgz
+          sudo mv ngrok /usr/local/bin/ngrok
+          ngrok config add-authtoken "${{ github.event.inputs.ngrok_token }}"
+
+      - name: Configure code-server
+        run: |
+          mkdir -p ~/.config/code-server
+          cat > ~/.config/code-server/config.yaml <<EOF
+          bind-addr: 127.0.0.1:8080
+          auth: password
+          password: ${{ github.event.inputs.password }}
+          cert: false
+          EOF
+
+      - name: Set default dark theme
+        run: |
+          mkdir -p ~/.local/share/code-server/User
+          cat > ~/.local/share/code-server/User/settings.json <<'EOF'
+          {
+            "workbench.colorTheme": "Default Dark Modern"
+          }
+          EOF
+
+      - name: Start code-server (background, opened in root repo)
+        run: |
+          cd "$WORK_DIR"
+          nohup code-server --bind-addr 127.0.0.1:8080 "$WORK_DIR" > "$HOME/code-server.log" 2>&1 &
+          sleep 10
+          echo "---- code-server.log ----"
+          cat "$HOME/code-server.log" || true
+
+      - name: Start ngrok tunnel (background)
+        run: |
+          nohup ngrok http 8080 --log=stdout --log-format=logfmt > ngrok.log 2>&1 &
+          sleep 8
+          echo "---- ngrok.log ----"
+          cat ngrok.log || true
+
+      - name: Retrieve public ngrok URL
+        run: |
+          url=""
+          for i in $(seq 1 10); do
+            resp=$(curl -s http://127.0.0.1:4040/api/tunnels || true)
+            url=$(echo "$resp" | grep -o '"public_url":"[^"]*"' | head -n1 | cut -d'"' -f4)
+            if [ -n "$url" ]; then
+              break
+            fi
+            sleep 3
+          done
+          if [ -z "$url" ]; then
+            echo "---- Diagnostic dump: ngrok not reachable at 127.0.0.1:4040 ----"
+            cat ngrok.log || true
+            echo "Failed to retrieve ngrok URL"
+            exit 1
+          fi
+          echo "CODE_SERVER_URL=$url" >> "$GITHUB_ENV"
+
+      - name: Print connection info
+        run: |
+          echo "=================================================="
+          echo " Code-Server is live at: ${{ env.CODE_SERVER_URL }}"
+          echo " Opened directly in: $WORK_DIR"
+          echo " Password was set via workflow input (not printed for security)"
+          echo "=================================================="
+
+      - name: Keep session alive (auto-saving work periodically)
+        run: |
+          minutes="${{ github.event.inputs.duration_minutes }}"
+          echo "Keeping runner alive for $minutes minutes..."
+          cd "$WORK_DIR"
+          end=$(( $(date +%s) + minutes * 60 ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            sleep 300
+            if [ -n "$(git status --porcelain)" ]; then
+              git add -A
+              git commit -m "Auto-save: $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
+              git push origin HEAD || echo "Push failed, will retry next cycle"
+            fi
+            echo "$(date): still alive, tunnel: ${{ env.CODE_SERVER_URL }}"
+          done
+
+      - name: Final commit and push (always runs, even if cancelled/failed)
+        if: always()
+        run: |
+          cd "$WORK_DIR" || exit 0
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "Final auto-save: $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
+            git push origin HEAD || echo "Final push failed"
+          else
+            echo "No changes to commit."
+          fi
