@@ -71,70 +71,60 @@ jobs:
         env:
           JUPYTER_PASSWORD: ${{ github.event.inputs.jupyter_password }}
 
-      - name: Start Jupyter Lab
+      - name: Start Services and Keep Alive
+        shell: bash
         run: |
-          Start-Process -NoNewWindow -FilePath "python" -ArgumentList "-m","jupyter","lab"
-          Start-Sleep -Seconds 10 # Give Jupyter some time to start
-
-      - name: Start ngrok
-        run: |
-          Start-Process -FilePath "ngrok" -ArgumentList "http","8888","--log=stdout" -NoNewWindow -RedirectStandardOutput "ngrok.log" -RedirectStandardError "ngrok_err.log"
-          Start-Sleep -Seconds 5 # Give ngrok some time to establish tunnel
-
-      - name: Display ngrok URL
-        run: |
-          $max_retries = 10
-          $retry_count = 0
-          $url = $null
-
-          while ($retry_count -lt $max_retries) {
-              try {
-                  $response = Invoke-WebRequest -Uri "http://127.0.0.1:4040/api/tunnels" -UseBasicParsing -ErrorAction Stop
-                  $json = $response.Content | ConvertFrom-Json
-                  if ($json.tunnels.Length -gt 0) {
-                      $url = $json.tunnels[0].public_url
-                      break
-                  }
-              } catch {
-                  Write-Host "Waiting for ngrok API to become available... ($retry_count/$max_retries)"
-              }
-              Start-Sleep -Seconds 3
-              $retry_count++
-          }
-
-          if ($url) {
-              Write-Host ""
-              Write-Host "=========================================================="
-              Write-Host "🌟 Jupyter Lab is successfully running!"
-              Write-Host "🔗 Access URL: $url"
-              Write-Host "🔑 Password: [Provided at workflow start]"
-              Write-Host "=========================================================="
-              Write-Host ""
-          } else {
-              Write-Error "Failed to fetch ngrok URL. Ensure ngrok started successfully."
-              Write-Host "--- ngrok.log ---"
-              if (Test-Path ngrok.log) { Get-Content ngrok.log }
-              Write-Host "--- ngrok_err.log ---"
-              if (Test-Path ngrok_err.log) { Get-Content ngrok_err.log }
+          echo "Starting Jupyter Lab..."
+          python -m jupyter lab > jupyter.log 2>&1 &
+          
+          echo "Starting ngrok..."
+          ngrok http 8888 --log=stdout > ngrok.log 2>&1 &
+          
+          max_retries=10
+          retry_count=0
+          url="null"
+          
+          while [ $retry_count -lt $max_retries ]; do
+              sleep 3
+              response=$(curl -s http://127.0.0.1:4040/api/tunnels || echo '{"tunnels":[]}')
+              url=$(echo "$response" | jq -r '.tunnels[0].public_url // "null"')
+              
+              if [ "$url" != "null" ] && [ -n "$url" ]; then
+                  break
+              fi
+              echo "Waiting for ngrok API to become available... ($retry_count/$max_retries)"
+              retry_count=$((retry_count+1))
+          done
+          
+          if [ "$url" != "null" ] && [ -n "$url" ]; then
+              echo ""
+              echo "=========================================================="
+              echo "🌟 Jupyter Lab is successfully running!"
+              echo "🔗 Access URL: $url"
+              echo "🔑 Password: [Provided at workflow start]"
+              echo "=========================================================="
+              echo ""
+          else
+              echo "::error::Failed to fetch ngrok URL. Ensure ngrok started successfully."
+              echo "--- ngrok.log ---"
+              cat ngrok.log || true
+              echo "--- jupyter.log ---"
+              cat jupyter.log || true
               exit 1
-          }
-
-      - name: Keep Alive for 350 minutes
-        run: |
-          Write-Host "Keeping workflow alive for 350 minutes..."
-          for ($i=1; $i -le 35; $i++) {
-              Start-Sleep -Seconds 600
-              Write-Host "Workflow running... ($($i * 10) / 350 minutes)"
+          fi
+          
+          echo "Keeping workflow alive for 350 minutes..."
+          for i in {1..35}; do
+              sleep 600
+              echo "Workflow running... ($((i * 10)) / 350 minutes)"
               
-              $ngrok_alive = Get-Process ngrok -ErrorAction SilentlyContinue
-              if (-not $ngrok_alive) {
-                  Write-Error "Ngrok process stopped unexpectedly!"
+              if ! ps -W | grep -i ngrok > /dev/null; then
+                  echo "::error::Ngrok process stopped unexpectedly!"
                   exit 1
-              }
+              fi
               
-              $jupyter_port = Get-NetTCPConnection -LocalPort 8888 -ErrorAction SilentlyContinue
-              if (-not $jupyter_port) {
-                  Write-Error "Jupyter Lab on port 8888 stopped unexpectedly!"
+              if ! netstat -an | grep 8888 | grep LISTEN > /dev/null; then
+                  echo "::error::Jupyter Lab on port 8888 stopped unexpectedly!"
                   exit 1
-              }
-          }
+              fi
+          done
