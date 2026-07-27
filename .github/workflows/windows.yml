@@ -78,15 +78,31 @@ jobs:
 
       - name: Start ngrok
         run: |
-          Start-Process -NoNewWindow -FilePath "ngrok" -ArgumentList "http","8888"
+          Start-Process -FilePath "ngrok" -ArgumentList "http","8888","--log=stdout" -NoNewWindow -RedirectStandardOutput "ngrok.log" -RedirectStandardError "ngrok_err.log"
           Start-Sleep -Seconds 5 # Give ngrok some time to establish tunnel
 
       - name: Display ngrok URL
         run: |
-          try {
-              $response = Invoke-WebRequest -Uri "http://127.0.0.1:4040/api/tunnels" -UseBasicParsing
-              $json = $response.Content | ConvertFrom-Json
-              $url = $json.tunnels[0].public_url
+          $max_retries = 10
+          $retry_count = 0
+          $url = $null
+
+          while ($retry_count -lt $max_retries) {
+              try {
+                  $response = Invoke-WebRequest -Uri "http://127.0.0.1:4040/api/tunnels" -UseBasicParsing -ErrorAction Stop
+                  $json = $response.Content | ConvertFrom-Json
+                  if ($json.tunnels.Length -gt 0) {
+                      $url = $json.tunnels[0].public_url
+                      break
+                  }
+              } catch {
+                  Write-Host "Waiting for ngrok API to become available... ($retry_count/$max_retries)"
+              }
+              Start-Sleep -Seconds 3
+              $retry_count++
+          }
+
+          if ($url) {
               Write-Host ""
               Write-Host "=========================================================="
               Write-Host "🌟 Jupyter Lab is successfully running!"
@@ -94,8 +110,12 @@ jobs:
               Write-Host "🔑 Password: [Provided at workflow start]"
               Write-Host "=========================================================="
               Write-Host ""
-          } catch {
+          } else {
               Write-Error "Failed to fetch ngrok URL. Ensure ngrok started successfully."
+              Write-Host "--- ngrok.log ---"
+              if (Test-Path ngrok.log) { Get-Content ngrok.log }
+              Write-Host "--- ngrok_err.log ---"
+              if (Test-Path ngrok_err.log) { Get-Content ngrok_err.log }
               exit 1
           }
 
