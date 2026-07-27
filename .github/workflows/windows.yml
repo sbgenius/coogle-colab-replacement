@@ -1,0 +1,120 @@
+name: Jupyter Lab on Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      ngrok_token:
+        description: 'Ngrok Authtoken'
+        required: true
+        type: string
+      jupyter_password:
+        description: 'Jupyter Lab Password'
+        required: true
+        type: string
+
+jobs:
+  run-jupyter-lab:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install jupyterlab
+
+      - name: Install ngrok
+        run: |
+          choco install ngrok -y
+
+      - name: Configure ngrok
+        run: |
+          ngrok config add-authtoken $env:NGROK_TOKEN
+        env:
+          NGROK_TOKEN: ${{ github.event.inputs.ngrok_token }}
+
+      - name: Configure Jupyter Lab
+        shell: python
+        run: |
+          import os
+          from jupyter_server.auth import passwd
+          import json
+          
+          password = os.environ.get("JUPYTER_PASSWORD")
+          hash_str = passwd(password)
+          
+          config_dir = os.path.expanduser("~/.jupyter")
+          os.makedirs(config_dir, exist_ok=True)
+          config_path = os.path.join(config_dir, "jupyter_server_config.json")
+          
+          config = {
+            "ServerApp": {
+              "password": hash_str,
+              "ip": "127.0.0.1",
+              "port": 8888,
+              "open_browser": False,
+              "allow_root": True,
+              "allow_remote_access": True
+            }
+          }
+          
+          with open(config_path, "w") as f:
+              json.dump(config, f)
+        env:
+          JUPYTER_PASSWORD: ${{ github.event.inputs.jupyter_password }}
+
+      - name: Start Jupyter Lab
+        run: |
+          Start-Process -NoNewWindow -FilePath "python" -ArgumentList "-m","jupyter","lab"
+          Start-Sleep -Seconds 10 # Give Jupyter some time to start
+
+      - name: Start ngrok
+        run: |
+          Start-Process -NoNewWindow -FilePath "ngrok" -ArgumentList "http","8888"
+          Start-Sleep -Seconds 5 # Give ngrok some time to establish tunnel
+
+      - name: Display ngrok URL
+        run: |
+          try {
+              $response = Invoke-WebRequest -Uri "http://127.0.0.1:4040/api/tunnels" -UseBasicParsing
+              $json = $response.Content | ConvertFrom-Json
+              $url = $json.tunnels[0].public_url
+              Write-Host ""
+              Write-Host "=========================================================="
+              Write-Host "🌟 Jupyter Lab is successfully running!"
+              Write-Host "🔗 Access URL: $url"
+              Write-Host "🔑 Password: [Provided at workflow start]"
+              Write-Host "=========================================================="
+              Write-Host ""
+          } catch {
+              Write-Error "Failed to fetch ngrok URL. Ensure ngrok started successfully."
+              exit 1
+          }
+
+      - name: Keep Alive for 350 minutes
+        run: |
+          Write-Host "Keeping workflow alive for 350 minutes..."
+          for ($i=1; $i -le 35; $i++) {
+              Start-Sleep -Seconds 600
+              Write-Host "Workflow running... ($($i * 10) / 350 minutes)"
+              
+              $ngrok_alive = Get-Process ngrok -ErrorAction SilentlyContinue
+              if (-not $ngrok_alive) {
+                  Write-Error "Ngrok process stopped unexpectedly!"
+                  exit 1
+              }
+              
+              $jupyter_port = Get-NetTCPConnection -LocalPort 8888 -ErrorAction SilentlyContinue
+              if (-not $jupyter_port) {
+                  Write-Error "Jupyter Lab on port 8888 stopped unexpectedly!"
+                  exit 1
+              }
+          }
