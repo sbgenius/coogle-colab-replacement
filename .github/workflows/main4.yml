@@ -32,7 +32,7 @@
 # Set `compress_level: 0` if you truly want raw chunks.
 # ---------------------------------------------------------------------------
 
-name: Persistent Workspace 4 kde
+name: Persistent Workspace 2
 
 on:
   workflow_dispatch:
@@ -290,7 +290,12 @@ jobs:
           # restored snapshot that still thinks :1 is in use.
           rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
           vncserver -kill :1 >/dev/null 2>&1 || true
+          # -SecurityTypes/-PasswordFile are required explicitly: recent
+          # TigerVNC builds (Ubuntu 22.04/24.04) default to one-time-password
+          # mode instead of reading ~/.vnc/passwd, which is what produces
+          # "No password configured for VNC Auth" even though the file exists.
           vncserver :1 -geometry 1280x800 -depth 24 -localhost no \
+            -SecurityTypes VncAuth -PasswordFile "$VNC_PW_FILE" \
             >>/var/log/vncserver.log 2>&1
 
           websockify --web=/usr/share/novnc 6080 localhost:5901 \
