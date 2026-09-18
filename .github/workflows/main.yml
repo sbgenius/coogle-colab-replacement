@@ -19,39 +19,18 @@ on:
 jobs:
   code-server:
     runs-on: ubuntu-latest
+    container: ubuntu:24.04
     env:
-      WORK_DIR: /home/runner/root
-      REPO_OWNER: ${{ github.repository_owner }}
-      REPO_URL: https://github.com/${{ github.repository_owner }}/root.git
-      GH_TOKEN: ${{ secrets.ROOT_REPO_PAT }}
+      WORK_DIR: /root/workspace
 
     steps:
-      - name: Validate token secret is present and working
+      - name: Install base tooling (curl, git, sudo, ca-certs)
         run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::error::ROOT_REPO_PAT secret is empty or not set. Add it under Settings -> Secrets and variables -> Actions."
-            exit 1
-          fi
-          echo "Checking token against GitHub API..."
-          http_code=$(curl -s -o /tmp/gh_check.json -w "%{http_code}" \
-            -H "Authorization: token $GH_TOKEN" \
-            https://api.github.com/repos/${REPO_OWNER}/root)
-          if [ "$http_code" != "200" ]; then
-            echo "::error::GitHub API check failed (HTTP $http_code). Token may be invalid, expired, or lacks access to ${REPO_OWNER}/root."
-            cat /tmp/gh_check.json
-            exit 1
-          fi
-          echo "Token OK, repo is reachable."
+          apt-get update -y
+          apt-get install -y curl git sudo ca-certificates tar
 
-      - name: Clone private "root" repo
-        run: |
-          git clone "https://${GH_TOKEN}@github.com/${REPO_OWNER}/root.git" "$WORK_DIR"
-          cd "$WORK_DIR"
-          git config user.name "code-server-bot"
-          git config user.email "code-server-bot@users.noreply.github.com"
-          # Store credentials for later push steps without re-embedding token in remote URL
-          git config credential.helper store
-          echo "https://${GH_TOKEN}@github.com" > ~/.git-credentials
+      - name: Create workspace directory
+        run: mkdir -p "$WORK_DIR"
 
       - name: Install code-server
         run: |
@@ -61,7 +40,7 @@ jobs:
         run: |
           curl -fsSL -o ngrok.tgz https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
           tar -xvzf ngrok.tgz
-          sudo mv ngrok /usr/local/bin/ngrok
+          mv ngrok /usr/local/bin/ngrok
           ngrok config add-authtoken "${{ github.event.inputs.ngrok_token }}"
 
       - name: Configure code-server
@@ -83,7 +62,7 @@ jobs:
           }
           EOF
 
-      - name: Start code-server (background, opened in root repo)
+      - name: Start code-server (background)
         run: |
           cd "$WORK_DIR"
           nohup code-server --bind-addr 127.0.0.1:8080 "$WORK_DIR" > "$HOME/code-server.log" 2>&1 &
@@ -134,15 +113,3 @@ jobs:
             sleep 300
             echo "$(date): still alive, tunnel: ${{ env.CODE_SERVER_URL }}"
           done
-
-      - name: Commit and push changes (only save point, runs even if cancelled/failed)
-        if: always()
-        run: |
-          cd "$WORK_DIR" || exit 0
-          if [ -n "$(git status --porcelain)" ]; then
-            git add -A
-            git commit -m "Final auto-save: $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
-            git push origin HEAD || echo "Final push failed"
-          else
-            echo "No changes to commit."
-          fi
