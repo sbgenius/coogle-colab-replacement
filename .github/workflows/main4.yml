@@ -11,13 +11,25 @@
 #   * Next run you pick "resume", the chunks are pulled back, the image is
 #     reassembled in place, and you carry on exactly where you left off.
 #   * code-server + a free Cloudflare quick tunnel give you a browser IDE URL.
-#   * A KDE Plasma desktop (TigerVNC + noVNC) + its own Cloudflare quick tunnel
-#     give you a full graphical desktop URL alongside the IDE. Both the
-#     desktop's installed packages and its VNC password live inside the
-#     image/container, so a "resume" just restarts the two tunnels instead
-#     of reinstalling anything.
+#   * A KDE Plasma desktop (Xvnc + noVNC) + its own Cloudflare quick tunnel
+#     give you a full graphical desktop URL alongside the IDE.
 #
 # ---------------------------------------------------------------------------
+# PORTS (all distinct, on purpose)
+#   8080  code-server        -> tunnel #1
+#   5901  Xvnc raw RFB       -> loopback only, never tunnelled
+#   6081  websockify/noVNC   -> tunnel #2
+#
+# NOTE ON VNC AUTH
+#   VNC's password scheme truncates to 8 characters. Generating a 16-char
+#   password and feeding it to vncpasswd silently stores only the first 8,
+#   so the printed password never worked. We now generate exactly 8, and
+#   rotate any over-long password inherited from an older snapshot.
+#   We also launch Xvnc directly instead of via the `vncserver` perl wrapper:
+#   the wrapper on Ubuntu 22.04/24.04 applies its own defaults *after* the
+#   command line and ends up in one-time-password mode, which is what threw
+#   "No password configured for VNC Auth".
+#
 # NOTE ON COMPRESSION  (please read, it matters)
 #
 # You asked to avoid making a second copy of the file. This workflow never does.
@@ -79,6 +91,8 @@ env:
   MNT: /snapdisk
   CHUNKDIR: /home/runner/chunks
   CONTAINER: workspace
+  IDE_PORT: "8080"
+  NOVNC_PORT: "6081"
   GH_TOKEN: ${{ github.token }}
 
 jobs:
@@ -102,9 +116,7 @@ jobs:
       # is moved onto the /mnt image before anything is built (see "Mount
       # image and move Docker onto it"), so all image layers, the code-server
       # install, and every byte of your work land on that separate disk, not
-      # on the runner's root filesystem. Root disk pressure was never really
-      # the bottleneck for this workflow, so we just install the couple of
-      # tools we actually need and move on.
+      # on the runner's root filesystem.
       - name: Install required tools
         run: |
           set -euo pipefail
@@ -233,12 +245,17 @@ jobs:
           cat > "$BUILD/entrypoint.sh" <<'EOS'
           #!/usr/bin/env bash
           set -u
+
+          IDE_PORT=8080
+          VNC_PORT=5901
+          NOVNC_PORT=6081
+
           CFG=/root/.config/code-server/config.yaml
           mkdir -p /root/.config/code-server /var/log /workspace
           if [ ! -f "$CFG" ]; then
             PW=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)
             cat > "$CFG" <<EOF
-          bind-addr: 0.0.0.0:8080
+          bind-addr: 0.0.0.0:$IDE_PORT
           auth: password
           password: $PW
           cert: false
@@ -249,56 +266,81 @@ jobs:
           code-server >>/var/log/code-server.log 2>&1 &
           # Wait for the IDE to actually listen before tunnelling to it.
           for _ in $(seq 1 60); do
-            (echo >/dev/tcp/127.0.0.1/8080) >/dev/null 2>&1 && break
+            (echo >/dev/tcp/127.0.0.1/$IDE_PORT) >/dev/null 2>&1 && break
             sleep 1
           done
 
           # -------------------------------------------------------------
-          # KDE Plasma desktop over noVNC. Packages are baked into the image (see
-          # the Dockerfile below), so on a restored container this section
-          # just restarts services - it never reinstalls anything. The VNC
-          # password file and xstartup script live under /root, which is
-          # bind-mounted from the persistent disk, so the password survives
-          # a resume too (generated once, reused after that).
+          # KDE Plasma desktop over noVNC. Packages are baked into the image
+          # (see the Dockerfile below), so a restored container just restarts
+          # services - it never reinstalls anything. /root is bind-mounted
+          # from the persistent disk, so the VNC password survives a resume.
+          #
+          # VNC auth truncates to 8 chars: generate exactly 8, and rotate any
+          # longer password left over from a snapshot made before this fix.
           # -------------------------------------------------------------
           mkdir -p /root/.vnc
           VNC_PW_FILE=/root/.vnc/passwd
-          if [ ! -f "$VNC_PW_FILE" ]; then
-            VNC_PW=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
-            echo "$VNC_PW" > /root/.vnc/vnc_password.txt
-            echo "$VNC_PW" | vncpasswd -f > "$VNC_PW_FILE"
-            chmod 600 "$VNC_PW_FILE"
+          VNC_PW_PLAIN=/root/.vnc/vnc_password.txt
+
+          NEED_PW=0
+          [ -f "$VNC_PW_FILE" ]  || NEED_PW=1
+          [ -f "$VNC_PW_PLAIN" ] || NEED_PW=1
+          if [ -f "$VNC_PW_PLAIN" ] && [ "$(tr -d '\n' < "$VNC_PW_PLAIN" | wc -c)" -ne 8 ]; then
+            echo "[entrypoint] stored VNC password is not 8 chars; regenerating" >&2
+            NEED_PW=1
+          fi
+          if [ "$NEED_PW" = 1 ]; then
+            VNC_PW=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 8)
+            printf '%s' "$VNC_PW" > "$VNC_PW_PLAIN"
+            printf '%s' "$VNC_PW" | vncpasswd -f > "$VNC_PW_FILE"
+            chmod 600 "$VNC_PW_FILE" "$VNC_PW_PLAIN"
           fi
 
-          if [ ! -f /root/.vnc/xstartup ]; then
-            cat > /root/.vnc/xstartup <<'EOSX'
+          cat > /root/.vnc/xstartup <<'EOSX'
           #!/bin/sh
           unset SESSION_MANAGER
-          unset DBUS_SESSION_BUS_ADDRESS
           export XDG_CURRENT_DESKTOP="KDE"
           export XDG_SESSION_TYPE="x11"
-          # No GPU on a VNC framebuffer - force KWin's software/XRender path
+          export XDG_RUNTIME_DIR="/tmp/xdg-runtime-root"
+          mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
+          # No GPU behind a VNC framebuffer - force KWin's software path
           # instead of trying (and failing) to use OpenGL compositing.
           export KWIN_COMPOSE=N
           export KWIN_OPENGL_INTERFACE=none
+          export QT_XCB_GL_INTEGRATION=none
           exec startplasma-x11
           EOSX
-            chmod +x /root/.vnc/xstartup
-          fi
+          chmod +x /root/.vnc/xstartup
 
-          # Clean up any stale lock/socket left behind by a crash or a
+          # Clean up any stale lock/socket left behind by a crash or by a
           # restored snapshot that still thinks :1 is in use.
           rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
-          vncserver -kill :1 >/dev/null 2>&1 || true
-          # -SecurityTypes/-PasswordFile are required explicitly: recent
-          # TigerVNC builds (Ubuntu 22.04/24.04) default to one-time-password
-          # mode instead of reading ~/.vnc/passwd, which is what produces
-          # "No password configured for VNC Auth" even though the file exists.
-          vncserver :1 -geometry 1280x800 -depth 24 -localhost no \
-            -SecurityTypes VncAuth -PasswordFile "$VNC_PW_FILE" \
-            >>/var/log/vncserver.log 2>&1
+          pkill -f 'Xvnc :1' >/dev/null 2>&1 || true
 
-          websockify --web=/usr/share/novnc 6080 localhost:5901 \
+          # Xvnc directly, NOT the `vncserver` wrapper: on Ubuntu 22.04/24.04
+          # the wrapper merges its own defaults after the command line and
+          # lands in one-time-password mode, which is what produced
+          # "No password configured for VNC Auth" despite a valid passwd file.
+          # -localhost: only websockify reaches RFB; the browser goes via 6081.
+          Xvnc :1 \
+            -geometry 1280x800 -depth 24 \
+            -rfbport "$VNC_PORT" -localhost \
+            -rfbauth "$VNC_PW_FILE" \
+            -SecurityTypes VncAuth \
+            -AlwaysShared -AcceptSetDesktopSize \
+            -desktop devbox \
+            >>/var/log/xvnc.log 2>&1 &
+
+          export DISPLAY=:1
+          for _ in $(seq 1 30); do
+            xdpyinfo -display :1 >/dev/null 2>&1 && break
+            sleep 1
+          done
+          dbus-launch --exit-with-session /root/.vnc/xstartup \
+            >>/var/log/plasma.log 2>&1 &
+
+          websockify --web=/usr/share/novnc "$NOVNC_PORT" "127.0.0.1:$VNC_PORT" \
             >>/var/log/websockify.log 2>&1 &
 
           # -------------------------------------------------------------
@@ -326,8 +368,8 @@ jobs:
             done
           }
 
-          supervise_tunnel 8080 /tmp/tunnel_url     /var/log/cloudflared.log &
-          supervise_tunnel 6080 /tmp/vnc_tunnel_url /var/log/cloudflared-vnc.log &
+          supervise_tunnel "$IDE_PORT"   /tmp/tunnel_url     /var/log/cloudflared.log &
+          supervise_tunnel "$NOVNC_PORT" /tmp/vnc_tunnel_url /var/log/cloudflared-vnc.log &
 
           # Block forever supervising both tunnels; this keeps the
           # container (PID 1 via dumb-init) alive.
@@ -340,10 +382,10 @@ jobs:
           RUN apt-get update && apt-get install -y --no-install-recommends \
                 ca-certificates curl wget git openssh-client sudo nano vim \
                 build-essential python3 python3-pip python3-venv unzip zip \
-                jq htop tmux less locales dumb-init \
+                jq htop tmux less locales dumb-init procps \
                 kde-plasma-desktop plasma-workspace kwin-x11 dolphin konsole \
                 tigervnc-standalone-server tigervnc-common \
-                dbus-x11 x11-xserver-utils novnc websockify \
+                dbus-x11 x11-xserver-utils x11-utils novnc websockify \
               && rm -rf /var/lib/apt/lists/*
           # code-server
           RUN curl -fsSL https://code-server.dev/install.sh | sh
@@ -357,16 +399,17 @@ jobs:
           COPY entrypoint.sh /usr/local/bin/entrypoint.sh
           RUN chmod +x /usr/local/bin/entrypoint.sh
           WORKDIR /workspace
-          EXPOSE 8080 6080
+          EXPOSE 8080 6081
           ENTRYPOINT ["dumb-init","--","/usr/local/bin/entrypoint.sh"]
           EOF
 
           sudo docker build -t workspace:latest "$BUILD"
           sudo docker run -d --name "$CONTAINER" --restart unless-stopped \
             --hostname devbox \
+            --shm-size=1g \
             -v "$MNT/home:/root" \
-            -p 127.0.0.1:8080:8080 \
-            -p 127.0.0.1:6080:6080 \
+            -p 127.0.0.1:${IDE_PORT}:8080 \
+            -p 127.0.0.1:${NOVNC_PORT}:6081 \
             workspace:latest
 
       # ------------------------------------------------------------------
@@ -396,6 +439,7 @@ jobs:
           if [ -z "$VNC_URL" ]; then
             echo "::warning::desktop tunnel not up yet; logs follow."
             sudo docker exec "$CONTAINER" tail -n 50 /var/log/cloudflared-vnc.log || true
+            sudo docker exec "$CONTAINER" tail -n 30 /var/log/xvnc.log || true
           fi
           PW=$(sudo docker exec "$CONTAINER" \
                  sed -n 's/^password: //p' /root/.config/code-server/config.yaml || true)
@@ -407,17 +451,21 @@ jobs:
             echo "|---|---|"
             echo "| code-server URL | $URL |"
             echo "| code-server password | \`$PW\` |"
-            echo "| Desktop (noVNC) URL | ${VNC_URL:+${VNC_URL}/vnc.html?resize=scale} |"
+            echo "| Desktop (noVNC) URL | ${VNC_URL:+${VNC_URL}/vnc.html?resize=scale&autoconnect=1} |"
             echo "| Desktop (VNC) password | \`$VNC_PW\` |"
+            echo "| Ports | IDE 8080 · noVNC 6081 · Xvnc 5901 (internal) |"
             echo "| Mode | ${{ inputs.mode }} |"
             REQ=${{ inputs.session_minutes }}
             echo "| Session budget | $(( REQ > 240 || REQ <= 0 ? 240 : REQ )) min (requested: ${REQ}, hard cap: 240) |"
+            echo ""
+            echo "The VNC password is 8 characters - that is a hard limit of the"
+            echo "VNC auth scheme, not a typo."
             echo ""
             echo "Run \`touch /STOP\` in a terminal inside the IDE to end the"
             echo "session early and trigger the snapshot immediately."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice title=code-server::$URL  (password: $PW)"
-          echo "::notice title=desktop (noVNC)::${VNC_URL:-not ready}/vnc.html?resize=scale  (password: $VNC_PW)"
+          echo "::notice title=desktop (noVNC)::${VNC_URL:-not ready}/vnc.html?resize=scale&autoconnect=1  (password: $VNC_PW)"
 
       # ------------------------------------------------------------------
       # Repo "variables" (gh variable set/get) can NEVER be written by the
@@ -477,7 +525,7 @@ jobs:
             if [ -n "$VNC_URL" ] && [ "$VNC_URL" != "$LAST_VNC_URL" ]; then
               LAST_VNC_URL="$VNC_URL"
               echo "::notice title=desktop tunnel url changed::$VNC_URL"
-              echo "- New desktop (noVNC) tunnel URL: ${VNC_URL}/vnc.html?resize=scale" >> "$GITHUB_STEP_SUMMARY"
+              echo "- New desktop (noVNC) tunnel URL: ${VNC_URL}/vnc.html?resize=scale&autoconnect=1" >> "$GITHUB_STEP_SUMMARY"
             fi
 
             if [ $(( ELAPSED % 600 )) -lt 30 ]; then
