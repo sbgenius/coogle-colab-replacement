@@ -1,107 +1,500 @@
-name: Code-Server on Ubuntu Runner (ngrok)
+# .github/workflows/persistent-workspace.yml
+#
+# Persistent cloud dev box on GitHub Actions.
+#
+#   * All work lives inside ONE sparse disk-image file (ext4 on a loop device).
+#   * Docker's data-root is moved onto that image, so every container, layer,
+#     volume and byte you create lands inside the image and nothing else on the
+#     runner is touched.
+#   * At the end of the session the image is sliced into fixed-offset chunks and
+#     pushed to a brand-new GitHub Release as assets, with a manifest.
+#   * Next run you pick "resume", the chunks are pulled back, the image is
+#     reassembled in place, and you carry on exactly where you left off.
+#   * code-server + a free Cloudflare quick tunnel give you a browser IDE URL.
+#
+# ---------------------------------------------------------------------------
+# NOTE ON COMPRESSION  (please read, it matters)
+#
+# You asked to avoid making a second copy of the file. This workflow never does.
+# It reads a 1.5 GiB window straight out of the image with dd and pipes it into
+# zstd, so the only thing that ever hits the disk is the finished chunk. Peak
+# extra disk use is a few hundred MB, not 75 GB.
+#
+# Compression is not cosmetic here: mkfs scatters small metadata blocks every
+# 128 MB, so a "mostly empty" image has no chunk that is byte-for-byte zero and
+# raw chunking would upload the full 70 GB every single session. With zstd an
+# untouched chunk collapses to a few KB, so a fresh box snapshots in minutes.
+# Set `compress_level: 0` if you truly want raw chunks.
+# ---------------------------------------------------------------------------
+
+name: Persistent Workspace
+
 on:
   workflow_dispatch:
     inputs:
-      password:
-        description: 'Password to access code-server'
+      mode:
+        description: "Start fresh or resume a snapshot?"
+        type: choice
         required: true
+        default: new
+        options:
+          - new
+          - resume
+      snapshot_tag:
+        description: "Resume: release tag to restore. Leave empty for the newest snapshot."
         type: string
-      ngrok_token:
-        description: 'Your ngrok authtoken'
-        required: true
-        type: string
-      duration_minutes:
-        description: 'How long to keep the session alive (minutes)'
         required: false
-        default: '350'
+        default: ""
+      session_minutes:
+        description: "How long to keep the box alive before snapshotting (max ~300)."
         type: string
+        required: false
+        default: "240"
+      image_size:
+        description: "Disk image size (only used for mode=new). e.g. 70G"
+        type: string
+        required: false
+        default: "70G"
+      chunk_mb:
+        description: "Release asset chunk size in MiB."
+        type: string
+        required: false
+        default: "1536"
+      compress_level:
+        description: "zstd level for chunks. 0 = no compression (raw chunks)."
+        type: string
+        required: false
+        default: "3"
+      backup:
+        description: "Snapshot at the end of the session?"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  IMG: /mnt/workspace-disk/disk.img
+  MNT: /snapdisk
+  CHUNKDIR: /home/runner/chunks
+  CONTAINER: workspace
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
-  code-server:
+  workspace:
     runs-on: ubuntu-latest
-    env:
-      WORK_DIR: /home/runner/root
+    # Generous ceiling so the snapshot step always has room after the session
+    # timer fires. The session itself is bounded by `session_minutes`.
+    timeout-minutes: 350
 
     steps:
-      - name: Install code-server
-        run: |
-          curl -fsSL https://code-server.dev/install.sh | sh
+      # ------------------------------------------------------------------
+      - name: Checkout (shallow, workflow metadata only)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Install ngrok
+      # ------------------------------------------------------------------
+      - name: Reclaim runner disk space
         run: |
-          curl -fsSL -o ngrok.tgz https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
-          tar -xvzf ngrok.tgz
-          sudo mv ngrok /usr/local/bin/ngrok
-          ngrok config add-authtoken "${{ github.event.inputs.ngrok_token }}"
+          set -euo pipefail
+          echo "::group::before"
+          df -h / /mnt
+          echo "::endgroup::"
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /usr/local/share/chromium \
+            /usr/local/lib/node_modules || true
+          sudo docker image prune -af || true
+          sudo apt-get -y install zstd jq >/dev/null 2>&1 || true
+          echo "::group::after"
+          df -h / /mnt
+          echo "::endgroup::"
 
-      - name: Configure code-server
+      # ------------------------------------------------------------------
+      - name: Resolve snapshot to restore
+        id: resolve
+        if: ${{ inputs.mode == 'resume' }}
         run: |
-          mkdir -p ~/.config/code-server
-          cat > ~/.config/code-server/config.yaml <<EOF
-          bind-addr: 127.0.0.1:8080
-          auth: password
-          password: ${{ github.event.inputs.password }}
-          cert: false
-          EOF
-
-      - name: Set default dark theme
-        run: |
-          mkdir -p ~/.local/share/code-server/User
-          cat > ~/.local/share/code-server/User/settings.json <<'EOF'
-          {
-            "workbench.colorTheme": "Default Dark Modern"
-          }
-          EOF
-
-      - name: Start code-server (background, opened in root repo)
-        run: |
-          mkdir -p "$WORK_DIR"
-          cd "$WORK_DIR"
-          nohup code-server --bind-addr 127.0.0.1:8080 "$WORK_DIR" > "$HOME/code-server.log" 2>&1 &
-          sleep 10
-          echo "---- code-server.log ----"
-          cat "$HOME/code-server.log" || true
-
-      - name: Start ngrok tunnel (background)
-        run: |
-          nohup ngrok http 8080 --log=stdout --log-format=logfmt > ngrok.log 2>&1 &
-          sleep 8
-          echo "---- ngrok.log ----"
-          cat ngrok.log || true
-
-      - name: Retrieve public ngrok URL
-        run: |
-          url=""
-          for i in $(seq 1 10); do
-            resp=$(curl -s http://127.0.0.1:4040/api/tunnels || true)
-            url=$(echo "$resp" | grep -o '"public_url":"[^"]*"' | head -n1 | cut -d'"' -f4)
-            if [ -n "$url" ]; then
-              break
-            fi
-            sleep 3
-          done
-          if [ -z "$url" ]; then
-            echo "---- Diagnostic dump: ngrok not reachable at 127.0.0.1:4040 ----"
-            cat ngrok.log || true
-            echo "Failed to retrieve ngrok URL"
+          set -euo pipefail
+          TAG="${{ inputs.snapshot_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --limit 100 --json tagName,createdAt \
+                    --jq '[.[] | select(.tagName | startswith("snap-"))]
+                          | sort_by(.createdAt) | reverse | .[0].tagName // empty')
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::mode=resume but no snapshot release found."
             exit 1
           fi
-          echo "CODE_SERVER_URL=$url" >> "$GITHUB_ENV"
+          echo "Restoring from release: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Print connection info
+      # ------------------------------------------------------------------
+      - name: Create fresh disk image
+        if: ${{ inputs.mode == 'new' }}
         run: |
-          echo "=================================================="
-          echo " Code-Server is live at: ${{ env.CODE_SERVER_URL }}"
-          echo " Opened directly in: $WORK_DIR"
-          echo " Password was set via workflow input (not printed for security)"
-          echo "=================================================="
+          set -euo pipefail
+          sudo mkdir -p "$(dirname "$IMG")"
+          # Sparse: consumes only what is actually written.
+          sudo truncate -s "${{ inputs.image_size }}" "$IMG"
+          # -m0   : no reserved-for-root blocks
+          # -i 64K: ~1.1M inodes - plenty for node_modules etc, while keeping the
+          #         inode tables small enough that snapshots stay compact
+          sudo mkfs.ext4 -F -m 0 -i 65536 -L workspace "$IMG"
+          ls -lh "$IMG"; du -h --apparent-size "$IMG"; du -h "$IMG"
 
-      - name: Keep session alive
+      # ------------------------------------------------------------------
+      - name: Restore disk image from release chunks
+        if: ${{ inputs.mode == 'resume' }}
         run: |
-          minutes="${{ github.event.inputs.duration_minutes }}"
-          echo "Keeping runner alive for $minutes minutes..."
-          end=$(( $(date +%s) + minutes * 60 ))
-          while [ "$(date +%s)" -lt "$end" ]; do
-            sleep 300
-            echo "$(date): still alive, tunnel: ${{ env.CODE_SERVER_URL }}"
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.tag }}"
+          sudo mkdir -p "$(dirname "$IMG")" "$CHUNKDIR"
+          sudo chown "$USER" "$(dirname "$IMG")" "$CHUNKDIR"
+
+          gh release download "$TAG" -p manifest.json -D "$CHUNKDIR" --clobber
+          MAN="$CHUNKDIR/manifest.json"
+          jq . "$MAN"
+
+          TOTAL=$(jq -r .image_bytes "$MAN")
+          CHUNK_MB=$(jq -r .chunk_mb "$MAN")
+          N=$(jq -r '.chunks | length' "$MAN")
+          COMP=$(jq -r .compression "$MAN")
+
+          # Recreate the container file as a sparse file of the exact size.
+          truncate -s "$TOTAL" "$IMG"
+
+          fetch_one() {
+            local idx="$1" name="$2" sha="$3"
+            local dest="$CHUNKDIR/$name"
+            for try in 1 2 3; do
+              rm -f "$dest"
+              if gh release download "$TAG" -p "$name" -D "$CHUNKDIR" --clobber; then
+                if [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$sha" ]; then
+                  break
+                fi
+                echo "checksum mismatch on $name (attempt $try)" >&2
+              fi
+              [ "$try" = 3 ] && { echo "::error::failed to fetch $name"; exit 1; }
+              sleep 5
+            done
+            local seek=$(( idx * CHUNK_MB ))
+            if [ "$COMP" = "zstd" ]; then
+              zstd -dc "$dest" | dd of="$IMG" bs=1M seek="$seek" \
+                   conv=notrunc,sparse iflag=fullblock status=none
+            else
+              dd if="$dest" of="$IMG" bs=1M seek="$seek" \
+                 conv=notrunc,sparse iflag=fullblock status=none
+            fi
+            rm -f "$dest"
+            echo "restored chunk $idx/$N"
+          }
+          export -f fetch_one
+          export TAG CHUNKDIR IMG CHUNK_MB COMP N GH_TOKEN
+
+          # 4 at a time: downloads are the bottleneck, disk cost stays tiny.
+          jq -r '.chunks[] | "\(.index)\t\(.name)\t\(.sha256)"' "$MAN" \
+            | xargs -P 4 -n 3 bash -c 'fetch_one "$0" "$1" "$2"'
+
+          echo "Image reassembled:"; ls -lh "$IMG"; du -h "$IMG"
+          sudo e2fsck -p -f "$IMG" || true
+
+      # ------------------------------------------------------------------
+      - name: Mount image and move Docker onto it
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$MNT"
+          # discard => fstrim can punch holes back into the backing file,
+          # so deleted data really disappears from the next snapshot.
+          LOOP=$(sudo losetup --find --show "$IMG")
+          echo "LOOP=$LOOP" >> "$GITHUB_ENV"
+          sudo mount -o discard,noatime "$LOOP" "$MNT"
+          sudo mkdir -p "$MNT/docker" "$MNT/home"
+          df -h "$MNT"
+
+          sudo systemctl stop docker docker.socket containerd || true
+          echo '{ "data-root": "'"$MNT"'/docker", "storage-driver": "overlay2" }' \
+            | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker
+          sudo docker info --format 'Docker Root Dir: {{.DockerRootDir}}'
+
+      # ------------------------------------------------------------------
+      - name: Build workspace image (fresh box only)
+        if: ${{ inputs.mode == 'new' }}
+        run: |
+          set -euo pipefail
+          BUILD=$(mktemp -d)
+          cat > "$BUILD/entrypoint.sh" <<'EOS'
+          #!/usr/bin/env bash
+          set -u
+          CFG=/root/.config/code-server/config.yaml
+          mkdir -p /root/.config/code-server /var/log /workspace
+          if [ ! -f "$CFG" ]; then
+            PW=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)
+            cat > "$CFG" <<EOF
+          bind-addr: 0.0.0.0:8080
+          auth: password
+          password: $PW
+          cert: false
+          EOF
+          fi
+          rm -f /tmp/tunnel_url /STOP
+
+          code-server >>/var/log/code-server.log 2>&1 &
+          # Wait for the IDE to actually listen before tunnelling to it.
+          for _ in $(seq 1 60); do
+            (echo >/dev/tcp/127.0.0.1/8080) >/dev/null 2>&1 && break
+            sleep 1
           done
+
+          # Supervise the tunnel: quick tunnels die sometimes. Restart and
+          # publish the new hostname so the runner can print it for you.
+          while true; do
+            : > /var/log/cloudflared.log
+            cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate \
+              --logfile /var/log/cloudflared.log >>/var/log/cloudflared.log 2>&1 &
+            CF=$!
+            for _ in $(seq 1 90); do
+              URL=$(grep -ohE 'https://[a-z0-9-]+\.trycloudflare\.com' \
+                    /var/log/cloudflared.log 2>/dev/null | head -n1)
+              [ -n "${URL:-}" ] && { echo "$URL" > /tmp/tunnel_url; break; }
+              sleep 2
+            done
+            wait "$CF"
+            echo "[entrypoint] cloudflared exited, restarting" >> /var/log/cloudflared.log
+            rm -f /tmp/tunnel_url
+            sleep 3
+          done
+          EOS
+
+          cat > "$BUILD/Dockerfile" <<'EOF'
+          FROM ubuntu:24.04
+          ENV DEBIAN_FRONTEND=noninteractive SHELL=/bin/bash
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                ca-certificates curl wget git openssh-client sudo nano vim \
+                build-essential python3 python3-pip python3-venv unzip zip \
+                jq htop tmux less locales dumb-init \
+              && rm -rf /var/lib/apt/lists/*
+          # code-server
+          RUN curl -fsSL https://code-server.dev/install.sh | sh
+          # cloudflared
+          RUN arch="$(dpkg --print-architecture)" \
+              && curl -fsSL -o /tmp/cf.deb \
+                 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.deb" \
+              && dpkg -i /tmp/cf.deb && rm /tmp/cf.deb
+          COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+          RUN chmod +x /usr/local/bin/entrypoint.sh
+          WORKDIR /workspace
+          EXPOSE 8080
+          ENTRYPOINT ["dumb-init","--","/usr/local/bin/entrypoint.sh"]
+          EOF
+
+          sudo docker build -t workspace:latest "$BUILD"
+          sudo docker run -d --name "$CONTAINER" --restart unless-stopped \
+            --hostname devbox \
+            -v "$MNT/home:/root" \
+            -p 127.0.0.1:8080:8080 \
+            workspace:latest
+
+      # ------------------------------------------------------------------
+      - name: Start restored container
+        if: ${{ inputs.mode == 'resume' }}
+        run: |
+          set -euo pipefail
+          sudo docker start "$CONTAINER"
+          sudo docker ps
+
+      # ------------------------------------------------------------------
+      - name: Publish connection details
+        id: connect
+        run: |
+          set -euo pipefail
+          URL=""
+          for _ in $(seq 1 90); do
+            URL=$(sudo docker exec "$CONTAINER" cat /tmp/tunnel_url 2>/dev/null || true)
+            [ -n "$URL" ] && break
+            sleep 4
+          done
+          if [ -z "$URL" ]; then
+            echo "::warning::Tunnel not up yet; container logs follow."
+            sudo docker exec "$CONTAINER" tail -n 50 /var/log/cloudflared.log || true
+          fi
+          PW=$(sudo docker exec "$CONTAINER" \
+                 sed -n 's/^password: //p' /root/.config/code-server/config.yaml || true)
+          {
+            echo "## 🖥️  Workspace is up"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| URL | $URL |"
+            echo "| Password | \`$PW\` |"
+            echo "| Mode | ${{ inputs.mode }} |"
+            echo "| Session budget | ${{ inputs.session_minutes }} min |"
+            echo ""
+            echo "Run \`touch /STOP\` in a terminal inside the IDE to end the"
+            echo "session early and trigger the snapshot immediately."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=code-server::$URL  (password: $PW)"
+
+      # ------------------------------------------------------------------
+      - name: Hold the session open
+        run: |
+          set -uo pipefail
+          BUDGET=$(( ${{ inputs.session_minutes }} * 60 ))
+          START=$(date +%s)
+          LAST_URL=$(sudo docker exec "$CONTAINER" cat /tmp/tunnel_url 2>/dev/null || true)
+          while true; do
+            NOW=$(date +%s); ELAPSED=$(( NOW - START ))
+            [ "$ELAPSED" -ge "$BUDGET" ] && { echo "Session budget reached."; break; }
+
+            if sudo docker exec "$CONTAINER" test -f /STOP 2>/dev/null; then
+              echo "/STOP found inside the container - wrapping up early."
+              break
+            fi
+            if ! sudo docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+              echo "::warning::Container is gone, restarting it."
+              sudo docker start "$CONTAINER" || true
+            fi
+
+            URL=$(sudo docker exec "$CONTAINER" cat /tmp/tunnel_url 2>/dev/null || true)
+            if [ -n "$URL" ] && [ "$URL" != "$LAST_URL" ]; then
+              LAST_URL="$URL"
+              echo "::notice title=tunnel url changed::$URL"
+              echo "- New tunnel URL: $URL" >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            if [ $(( ELAPSED % 600 )) -lt 30 ]; then
+              printf '[%s] alive %dm/%dm  url=%s\n' \
+                "$(date -u +%H:%M:%S)" $((ELAPSED/60)) $((BUDGET/60)) "$LAST_URL"
+              df -h "$MNT" | tail -n1
+            fi
+            sleep 30
+          done
+
+      # ------------------------------------------------------------------
+      - name: Quiesce and unmount the image
+        if: ${{ always() && inputs.backup }}
+        run: |
+          set -euo pipefail
+          sudo docker stop -t 60 "$CONTAINER" || true
+          # Flush everything, then hand freed blocks back to the sparse file so
+          # deleted data does not ride along into the snapshot.
+          sudo fstrim -v "$MNT" || true
+          sync
+          sudo systemctl stop docker docker.socket containerd || true
+          sudo umount "$MNT"
+          sudo e2fsck -p -f "$IMG" || true
+          echo "apparent: $(du -h --apparent-size "$IMG" | cut -f1)   on-disk: $(du -h "$IMG" | cut -f1)"
+
+      # ------------------------------------------------------------------
+      - name: Snapshot to a new release
+        if: ${{ always() && inputs.backup }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$CHUNKDIR/meta"
+          TS=$(date -u +%Y%m%dT%H%M%SZ)
+          TAG="snap-${TS}-${{ github.run_id }}"
+          CHUNK_MB=${{ inputs.chunk_mb }}
+          LEVEL=${{ inputs.compress_level }}
+          TOTAL=$(stat -c%s "$IMG")
+          CHUNK_B=$(( CHUNK_MB * 1024 * 1024 ))
+          N=$(( (TOTAL + CHUNK_B - 1) / CHUNK_B ))
+          if [ "$LEVEL" -gt 0 ]; then COMP=zstd; EXT=".zst"; else COMP=none; EXT=""; fi
+
+          PARENT=""
+          [ "${{ inputs.mode }}" = "resume" ] && PARENT="${{ steps.resolve.outputs.tag }}"
+
+          gh release create "$TAG" \
+            --title "Workspace snapshot $TS" \
+            --notes "$(printf '%s\n' \
+              "Automatic workspace snapshot." \
+              "" \
+              "| field | value |" \
+              "|---|---|" \
+              "| created (UTC) | $TS |" \
+              "| image bytes | $TOTAL |" \
+              "| chunk size | ${CHUNK_MB} MiB |" \
+              "| chunk count | $N |" \
+              "| compression | $COMP (level $LEVEL) |" \
+              "| filesystem | ext4 |" \
+              "| parent snapshot | ${PARENT:-none (fresh box)} |" \
+              "| run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |" \
+              "| commit | ${{ github.sha }} |" \
+              "" \
+              "Resume with: Run workflow -> mode=resume, snapshot_tag=$TAG")"
+
+          upload_one() {
+            local i="$1"
+            local name; name=$(printf 'disk.part.%05d.img%s' "$i" "$EXT")
+            local dest="$CHUNKDIR/$name"
+            # Read a window straight out of the image and write ONLY the
+            # finished chunk. No full-size intermediate file, ever.
+            if [ "$COMP" = zstd ]; then
+              sudo dd if="$IMG" bs=1M skip=$(( i * CHUNK_MB )) count="$CHUNK_MB" \
+                   iflag=fullblock status=none \
+                | zstd -q -T2 -"$LEVEL" -o "$dest" -f
+            else
+              sudo dd if="$IMG" of="$dest" bs=1M skip=$(( i * CHUNK_MB )) \
+                   count="$CHUNK_MB" iflag=fullblock status=none
+              sudo chown "$USER" "$dest"
+            fi
+            local sha size
+            sha=$(sha256sum "$dest" | cut -d' ' -f1)
+            size=$(stat -c%s "$dest")
+            for try in 1 2 3; do
+              gh release upload "$TAG" "$dest" --clobber && break
+              [ "$try" = 3 ] && { echo "::error::upload failed for $name"; exit 1; }
+              sleep 10
+            done
+            rm -f "$dest"
+            jq -nc --argjson index "$i" --arg name "$name" \
+                   --arg sha256 "$sha" --argjson bytes "$size" \
+                   '{index:$index,name:$name,sha256:$sha256,bytes:$bytes}' \
+              > "$CHUNKDIR/meta/$(printf '%05d' "$i").json"
+            echo "uploaded $name ($(numfmt --to=iec "$size"))"
+          }
+          export -f upload_one
+          export IMG CHUNKDIR CHUNK_MB LEVEL COMP EXT TAG GH_TOKEN USER
+
+          # 3 workers: only 3 compressed chunks exist on disk at any moment.
+          seq 0 $(( N - 1 )) | xargs -P 3 -n 1 bash -c 'upload_one "$0"'
+
+          jq -s --arg tag "$TAG" --arg ts "$TS" --arg comp "$COMP" \
+                --argjson total "$TOTAL" --argjson cmb "$CHUNK_MB" \
+                --argjson level "$LEVEL" --arg parent "${PARENT:-}" \
+                --arg run "${{ github.run_id }}" \
+             '{schema:1, tag:$tag, created_utc:$ts, image_bytes:$total,
+               chunk_mb:$cmb, compression:$comp, compression_level:$level,
+               filesystem:"ext4", parent:$parent, run_id:$run,
+               chunks: (. | sort_by(.index))}' \
+             "$CHUNKDIR"/meta/*.json > "$CHUNKDIR/manifest.json"
+          gh release upload "$TAG" "$CHUNKDIR/manifest.json" --clobber
+
+          UPLOADED=$(jq '[.chunks[].bytes] | add' "$CHUNKDIR/manifest.json")
+          {
+            echo ""
+            echo "## 💾 Snapshot saved"
+            echo ""
+            echo "- Tag: \`$TAG\`"
+            echo "- Chunks: $N × ${CHUNK_MB} MiB windows, $COMP"
+            echo "- Uploaded: $(numfmt --to=iec "$UPLOADED") (image is $(numfmt --to=iec "$TOTAL") virtual)"
+            echo "- Resume: run this workflow with **mode=resume**, **snapshot_tag=\`$TAG\`**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=snapshot::$TAG"
+
+      # ------------------------------------------------------------------
+      - name: Tear down
+        if: ${{ always() }}
+        run: |
+          sudo umount "$MNT" 2>/dev/null || true
+          [ -n "${LOOP:-}" ] && sudo losetup -d "$LOOP" 2>/dev/null || true
+          sudo rm -f "$IMG" || true
+          df -h / /mnt || true
