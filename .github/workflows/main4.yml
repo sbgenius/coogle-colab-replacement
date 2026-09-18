@@ -4,15 +4,13 @@
 #
 #   * All work lives inside ONE sparse disk-image file (ext4 on a loop device).
 #   * Docker's data-root is moved onto that image, so every container, layer,
-#     volume and byte you create lands inside the image and nothing else on the
-#     runner is touched.
+#     volume and byte you create lands inside the image.
 #   * At the end of the session the image is sliced into fixed-offset chunks and
 #     pushed to a brand-new GitHub Release as assets, with a manifest.
 #   * Next run you pick "resume", the chunks are pulled back, the image is
-#     reassembled in place, and you carry on exactly where you left off.
-#   * code-server + a free Cloudflare quick tunnel give you a browser IDE URL.
-#   * A KDE Plasma desktop (Xvnc + noVNC) + its own Cloudflare quick tunnel
-#     give you a full graphical desktop URL alongside the IDE.
+#     reassembled in place, and you carry on where you left off.
+#   * code-server + Cloudflare quick tunnel  -> browser IDE.
+#   * KDE Plasma (Xvnc + noVNC) + its own tunnel -> full graphical desktop.
 #
 # ---------------------------------------------------------------------------
 # PORTS (all distinct, on purpose)
@@ -20,28 +18,34 @@
 #   5901  Xvnc raw RFB       -> loopback only, never tunnelled
 #   6081  websockify/noVNC   -> tunnel #2
 #
-# NOTE ON VNC AUTH
-#   VNC's password scheme truncates to 8 characters. Generating a 16-char
-#   password and feeding it to vncpasswd silently stores only the first 8,
-#   so the printed password never worked. We now generate exactly 8, and
-#   rotate any over-long password inherited from an older snapshot.
-#   We also launch Xvnc directly instead of via the `vncserver` perl wrapper:
-#   the wrapper on Ubuntu 22.04/24.04 applies its own defaults *after* the
-#   command line and ends up in one-time-password mode, which is what threw
-#   "No password configured for VNC Auth".
+# VNC PASSWORD
+#   Set via the `vnc_password` input. VNC's auth scheme hard-truncates to 8
+#   characters, so only the first 8 matter - a longer value still works, you
+#   just type the first 8. The passwd file is written with `echo` (vncpasswd -f
+#   reads a LINE from stdin; a printf without a trailing newline yields a
+#   ZERO-BYTE file, which is what produces "No password configured for VNC
+#   Auth"). The file is size-checked after writing and the run fails loudly
+#   if it came out empty, instead of silently handing you a broken desktop.
+#
+# CONTAINER LIFECYCLE
+#   The container is recreated from a fresh build every run, resume included.
+#   Previously a resume ran `docker start` on the container baked into the
+#   snapshot, so entrypoint changes never took effect. Your data lives in
+#   $MNT/home (bind-mounted to /root), not in the container layer, so
+#   recreating costs nothing. Docker's layer cache is on the same disk image,
+#   so the rebuild on resume is mostly cache hits.
 #
 # NOTE ON COMPRESSION  (please read, it matters)
 #
-# You asked to avoid making a second copy of the file. This workflow never does.
-# It reads a 1.5 GiB window straight out of the image with dd and pipes it into
-# zstd, so the only thing that ever hits the disk is the finished chunk. Peak
-# extra disk use is a few hundred MB, not 75 GB.
+# This workflow never makes a second copy of the image. It reads a 1.5 GiB
+# window straight out of the image with dd and pipes it into zstd, so the only
+# thing that ever hits the disk is the finished chunk. Peak extra disk use is a
+# few hundred MB, not 75 GB.
 #
-# Compression is not cosmetic here: mkfs scatters small metadata blocks every
-# 128 MB, so a "mostly empty" image has no chunk that is byte-for-byte zero and
-# raw chunking would upload the full 70 GB every single session. With zstd an
-# untouched chunk collapses to a few KB, so a fresh box snapshots in minutes.
-# Set `compress_level: 0` if you truly want raw chunks.
+# Compression is not cosmetic: mkfs scatters small metadata blocks every 128 MB,
+# so a "mostly empty" image has no chunk that is byte-for-byte zero and raw
+# chunking would upload the full 70 GB every session. With zstd an untouched
+# chunk collapses to a few KB. Set `compress_level: 0` for raw chunks.
 # ---------------------------------------------------------------------------
 
 name: Persistent Workspace kde mod
@@ -62,6 +66,11 @@ on:
         type: string
         required: false
         default: ""
+      vnc_password:
+        description: "Desktop (VNC) password. Only the first 8 characters are used - that is a VNC protocol limit."
+        type: string
+        required: false
+        default: "devbox123"
       session_minutes:
         description: "How long to keep the box alive before snapshotting. Hard-capped at 240 (4h) no matter what you enter here."
         type: string
@@ -99,7 +108,7 @@ jobs:
   workspace:
     runs-on: ubuntu-latest
     # Session is hard-capped at 4h (see the clamp in "Hold the session open").
-    # This ceiling adds ~100 min on top of that for setup, restore, and the
+    # This ceiling adds ~100 min on top for setup, restore, and the
     # snapshot/upload at the end, so the backup always has room to finish.
     timeout-minutes: 340
 
@@ -111,12 +120,6 @@ jobs:
           fetch-depth: 1
 
       # ------------------------------------------------------------------
-      # This used to delete the preinstalled dotnet/Android SDK/GHC/etc to
-      # free up root disk space. That's no longer needed: Docker's data-root
-      # is moved onto the /mnt image before anything is built (see "Mount
-      # image and move Docker onto it"), so all image layers, the code-server
-      # install, and every byte of your work land on that separate disk, not
-      # on the runner's root filesystem.
       - name: Install required tools
         run: |
           set -euo pipefail
@@ -237,8 +240,12 @@ jobs:
           sudo docker info --format 'Docker Root Dir: {{.DockerRootDir}}'
 
       # ------------------------------------------------------------------
-      - name: Build workspace image (fresh box only)
-        if: ${{ inputs.mode == 'new' }}
+      # Runs on BOTH new and resume. On resume the layer cache is already on
+      # the restored disk, so this is fast - and it guarantees the container
+      # actually runs the current entrypoint instead of a stale baked-in one.
+      - name: Build workspace image and (re)create container
+        env:
+          VNC_PASSWORD: ${{ inputs.vnc_password }}
         run: |
           set -euo pipefail
           BUILD=$(mktemp -d)
@@ -250,8 +257,9 @@ jobs:
           VNC_PORT=5901
           NOVNC_PORT=6081
 
+          mkdir -p /root/.config/code-server /root/.vnc /var/log /workspace
+
           CFG=/root/.config/code-server/config.yaml
-          mkdir -p /root/.config/code-server /var/log /workspace
           if [ ! -f "$CFG" ]; then
             PW=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)
             cat > "$CFG" <<EOF
@@ -271,30 +279,29 @@ jobs:
           done
 
           # -------------------------------------------------------------
-          # KDE Plasma desktop over noVNC. Packages are baked into the image
-          # (see the Dockerfile below), so a restored container just restarts
-          # services - it never reinstalls anything. /root is bind-mounted
-          # from the persistent disk, so the VNC password survives a resume.
+          # VNC password. Rewritten from $VNC_PASSWORD on EVERY boot, so the
+          # value you typed into the workflow is always the value that works -
+          # no stale password surviving inside a resumed snapshot.
           #
-          # VNC auth truncates to 8 chars: generate exactly 8, and rotate any
-          # longer password left over from a snapshot made before this fix.
+          # `echo`, not `printf '%s'`: vncpasswd -f reads a LINE from stdin.
+          # Without the trailing newline it reads nothing and emits a ZERO-BYTE
+          # file, and Xvnc then rejects every connection with "No password
+          # configured for VNC Auth".
           # -------------------------------------------------------------
-          mkdir -p /root/.vnc
           VNC_PW_FILE=/root/.vnc/passwd
           VNC_PW_PLAIN=/root/.vnc/vnc_password.txt
+          VNC_PW="${VNC_PASSWORD:-devbox123}"
 
-          NEED_PW=0
-          [ -f "$VNC_PW_FILE" ]  || NEED_PW=1
-          [ -f "$VNC_PW_PLAIN" ] || NEED_PW=1
-          if [ -f "$VNC_PW_PLAIN" ] && [ "$(tr -d '\n' < "$VNC_PW_PLAIN" | wc -c)" -ne 8 ]; then
-            echo "[entrypoint] stored VNC password is not 8 chars; regenerating" >&2
-            NEED_PW=1
-          fi
-          if [ "$NEED_PW" = 1 ]; then
-            VNC_PW=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 8)
-            printf '%s' "$VNC_PW" > "$VNC_PW_PLAIN"
-            printf '%s' "$VNC_PW" | vncpasswd -f > "$VNC_PW_FILE"
-            chmod 600 "$VNC_PW_FILE" "$VNC_PW_PLAIN"
+          echo "$VNC_PW" > "$VNC_PW_PLAIN"
+          echo "$VNC_PW" | vncpasswd -f > "$VNC_PW_FILE"
+          chmod 600 "$VNC_PW_FILE" "$VNC_PW_PLAIN"
+
+          # Fail loudly rather than serving a desktop nobody can log into.
+          PWSIZE=$(stat -c%s "$VNC_PW_FILE" 2>/dev/null || echo 0)
+          echo "[entrypoint] vnc passwd file is ${PWSIZE} bytes" >&2
+          if [ "$PWSIZE" -lt 8 ]; then
+            echo "[entrypoint] FATAL: vncpasswd produced an empty/short file" >&2
+            echo "VNC_PASSWD_FILE_BAD" > /tmp/vnc_error
           fi
 
           cat > /root/.vnc/xstartup <<'EOSX'
@@ -313,16 +320,14 @@ jobs:
           EOSX
           chmod +x /root/.vnc/xstartup
 
-          # Clean up any stale lock/socket left behind by a crash or by a
-          # restored snapshot that still thinks :1 is in use.
+          # Clear stale locks from a crash or a restored snapshot.
           rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
           pkill -f 'Xvnc :1' >/dev/null 2>&1 || true
 
           # Xvnc directly, NOT the `vncserver` wrapper: on Ubuntu 22.04/24.04
-          # the wrapper merges its own defaults after the command line and
-          # lands in one-time-password mode, which is what produced
-          # "No password configured for VNC Auth" despite a valid passwd file.
-          # -localhost: only websockify reaches RFB; the browser goes via 6081.
+          # the wrapper merges its own defaults AFTER the command line and can
+          # land in one-time-password mode regardless of the flags you pass.
+          # -localhost: only websockify reaches raw RFB; browsers use 6081.
           Xvnc :1 \
             -geometry 1280x800 -depth 24 \
             -rfbport "$VNC_PORT" -localhost \
@@ -346,7 +351,7 @@ jobs:
           # -------------------------------------------------------------
           # Supervise both Cloudflare quick tunnels - one for code-server,
           # one for the desktop. Quick tunnels die sometimes; restart and
-          # republish the new hostname so the runner can print it for you.
+          # republish the new hostname so the runner can print it.
           # -------------------------------------------------------------
           supervise_tunnel() {
             local port="$1" urlfile="$2" logfile="$3"
@@ -404,21 +409,19 @@ jobs:
           EOF
 
           sudo docker build -t workspace:latest "$BUILD"
+
+          # Drop any container from a previous session. All real data is in
+          # $MNT/home, which is bind-mounted, so nothing is lost.
+          sudo docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+
           sudo docker run -d --name "$CONTAINER" --restart unless-stopped \
             --hostname devbox \
             --shm-size=1g \
+            -e VNC_PASSWORD="$VNC_PASSWORD" \
             -v "$MNT/home:/root" \
             -p 127.0.0.1:${IDE_PORT}:8080 \
             -p 127.0.0.1:${NOVNC_PORT}:6081 \
             workspace:latest
-
-      # ------------------------------------------------------------------
-      - name: Start restored container
-        if: ${{ inputs.mode == 'resume' }}
-        run: |
-          set -euo pipefail
-          sudo docker start "$CONTAINER"
-          sudo docker ps
 
       # ------------------------------------------------------------------
       - name: Publish connection details
@@ -432,6 +435,15 @@ jobs:
             [ -n "$URL" ] && [ -n "$VNC_URL" ] && break
             sleep 4
           done
+
+          # Surface a broken passwd file immediately instead of letting you
+          # discover it by getting rejected in the browser.
+          if sudo docker exec "$CONTAINER" test -f /tmp/vnc_error 2>/dev/null; then
+            echo "::error::VNC password file was not written correctly - see xvnc.log below."
+            sudo docker exec "$CONTAINER" ls -l /root/.vnc/ || true
+            sudo docker exec "$CONTAINER" tail -n 40 /var/log/xvnc.log || true
+          fi
+
           if [ -z "$URL" ]; then
             echo "::warning::code-server tunnel not up yet; logs follow."
             sudo docker exec "$CONTAINER" tail -n 50 /var/log/cloudflared.log || true
@@ -441,9 +453,11 @@ jobs:
             sudo docker exec "$CONTAINER" tail -n 50 /var/log/cloudflared-vnc.log || true
             sudo docker exec "$CONTAINER" tail -n 30 /var/log/xvnc.log || true
           fi
+
           PW=$(sudo docker exec "$CONTAINER" \
                  sed -n 's/^password: //p' /root/.config/code-server/config.yaml || true)
           VNC_PW=$(sudo docker exec "$CONTAINER" cat /root/.vnc/vnc_password.txt 2>/dev/null || true)
+          PWSIZE=$(sudo docker exec "$CONTAINER" stat -c%s /root/.vnc/passwd 2>/dev/null || echo 0)
           {
             echo "## 🖥️  Workspace is up"
             echo ""
@@ -452,14 +466,12 @@ jobs:
             echo "| code-server URL | $URL |"
             echo "| code-server password | \`$PW\` |"
             echo "| Desktop (noVNC) URL | ${VNC_URL:+${VNC_URL}/vnc.html?resize=scale&autoconnect=1} |"
-            echo "| Desktop (VNC) password | \`$VNC_PW\` |"
+            echo "| Desktop (VNC) password | \`$VNC_PW\` (type the first 8 chars) |"
+            echo "| VNC passwd file | ${PWSIZE} bytes (must be > 0) |"
             echo "| Ports | IDE 8080 · noVNC 6081 · Xvnc 5901 (internal) |"
             echo "| Mode | ${{ inputs.mode }} |"
             REQ=${{ inputs.session_minutes }}
             echo "| Session budget | $(( REQ > 240 || REQ <= 0 ? 240 : REQ )) min (requested: ${REQ}, hard cap: 240) |"
-            echo ""
-            echo "The VNC password is 8 characters - that is a hard limit of the"
-            echo "VNC auth scheme, not a typo."
             echo ""
             echo "Run \`touch /STOP\` in a terminal inside the IDE to end the"
             echo "session early and trigger the snapshot immediately."
@@ -470,10 +482,9 @@ jobs:
       # ------------------------------------------------------------------
       # Repo "variables" (gh variable set/get) can NEVER be written by the
       # built-in GITHUB_TOKEN, no matter what's in `permissions:` - that API
-      # simply isn't in its scope list. A git ref is, since it only needs
-      # `contents: write`, which we already have. So the stop signal is: does
-      # refs/tags/stop-signal exist? Clear any leftover one from a previous
-      # run so it doesn't kill this one instantly.
+      # isn't in its scope list. A git ref is, since it only needs
+      # `contents: write`. So the stop signal is: does refs/tags/stop-signal
+      # exist? Clear any leftover one so it doesn't kill this run instantly.
       - name: Reset stop switch
         env:
           GH_TOKEN: ${{ github.token }}
@@ -506,7 +517,7 @@ jobs:
               break
             fi
             if gh api "repos/${{ github.repository }}/git/refs/tags/stop-signal" >/dev/null 2>&1; then
-              echo "stop-signal tag found (set from the 'Stop Workspace Session' workflow) - wrapping up early."
+              echo "stop-signal tag found - wrapping up early."
               break
             fi
             if ! sudo docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
