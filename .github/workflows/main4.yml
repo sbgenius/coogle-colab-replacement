@@ -18,44 +18,30 @@
 #   5901  Xvnc raw RFB       -> loopback only, never tunnelled
 #   6081  websockify/noVNC   -> tunnel #2
 #
-# VNC PASSWORD - HOW IT'S ACTUALLY WRITTEN
-#   Ubuntu 24.04's tigervnc-common / tigervnc-standalone-server packages do
-#   NOT ship a `vncpasswd` (or `tigervncpasswd`) binary. Every earlier attempt
-#   to pipe a password into that command failed with "command not found",
-#   which - piped into a file redirect - silently produced a 0-byte passwd
-#   file and Xvnc then rejected all logins with "No password configured for
-#   VNC Auth". There was never a wrong password; the tool doesn't exist here.
+# VNC PASSWORD
+#   Ubuntu 24.04's tigervnc packages ship no `vncpasswd`/`tigervncpasswd`
+#   binary. The passwd file is written by an embedded pure-Python DES
+#   routine (genpasswd.py) implementing VNC's standard fixed-key DES-ECB
+#   obfuscation. Verified byte-for-byte against the `cryptography` library.
 #
-#   VNC's passwd file format is public (it's obfuscation, not real security):
-#   the password, truncated/null-padded to 8 bytes, DES-ECB encrypted with a
-#   FIXED key that is bit-reversed per-byte before use. This workflow writes
-#   that file itself with a small embedded pure-Python DES implementation -
-#   no external vncpasswd dependency, so it can't silently no-op again.
-#   Verified against a real Xvnc instance before being folded in here.
+# XVNC / WEBSOCKIFY SUPERVISION
+#   Each is launched exactly once, from inside its own restart loop - never
+#   started once outside the loop and then also "supervised" via a captured
+#   PID. An earlier version did the latter, which raced two Xvnc instances
+#   against the same :1 display/socket lock and crash-looped the desktop.
+#   Do not manually kill these processes from a shell inside the box; let
+#   the loops handle restarts, or use /STOP to end the whole session.
 #
 # CONTAINER LIFECYCLE
 #   The container is `docker rm -f` + recreated from a fresh build on EVERY
-#   run, resume included. Your data lives in $MNT/home (bind-mounted to
-#   /root), not in the container's own layer, so recreating it costs nothing
-#   and guarantees the current entrypoint is what actually runs - a resume
-#   restarting a container baked into an old snapshot was the earlier bug.
+#   run, resume included, so entrypoint changes always take effect. Data
+#   lives in $MNT/home (bind-mounted to /root), so recreating the container
+#   costs nothing.
 #
-#   Do not manually `pkill`/restart Xvnc, websockify, or cloudflared inside a
-#   live shell - they're supervised by the entrypoint's own loops, and
-#   killing one out from under that supervision is what took the whole
-#   session down previously. Use /STOP (see below) instead.
-#
-# NOTE ON COMPRESSION  (please read, it matters)
-#
-# This workflow never makes a second copy of the image. It reads a 1.5 GiB
-# window straight out of the image with dd and pipes it into zstd, so the only
-# thing that ever hits the disk is the finished chunk. Peak extra disk use is a
-# few hundred MB, not 75 GB.
-#
-# Compression is not cosmetic: mkfs scatters small metadata blocks every 128 MB,
-# so a "mostly empty" image has no chunk that is byte-for-byte zero and raw
-# chunking would upload the full 70 GB every session. With zstd an untouched
-# chunk collapses to a few KB. Set `compress_level: 0` for raw chunks.
+# NOTE ON COMPRESSION
+#   Never makes a second copy of the image: each chunk is read straight out
+#   with dd and piped into zstd, so only the finished (small) chunk ever
+#   hits disk. Set compress_level: 0 for raw chunks.
 # ---------------------------------------------------------------------------
 
 name: Persistent Workspace kde mod
@@ -77,7 +63,7 @@ on:
         required: false
         default: ""
       vnc_password:
-        description: "Desktop (VNC) password. Only the first 8 characters are used - that is a VNC protocol limit, not a bug."
+        description: "Desktop (VNC) password. Only the first 8 characters are used - VNC protocol limit."
         type: string
         required: false
         default: "devbox123"
@@ -103,7 +89,7 @@ on:
         default: "3"
 
 permissions:
-  contents: write   # release assets, and the stop-signal git ref used by the Stop button
+  contents: write
 
 env:
   IMG: /mnt/workspace-disk/disk.img
@@ -120,25 +106,17 @@ jobs:
     timeout-minutes: 340
 
     steps:
-      # ------------------------------------------------------------------
       - name: Checkout (shallow, workflow metadata only)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # ------------------------------------------------------------------
       - name: Install required tools
         run: |
           set -euo pipefail
-          echo "::group::disk before"
-          df -h / /mnt
-          echo "::endgroup::"
           sudo apt-get -y install zstd jq >/dev/null 2>&1 || true
-          echo "::group::disk after"
           df -h / /mnt
-          echo "::endgroup::"
 
-      # ------------------------------------------------------------------
       - name: Resolve snapshot to restore
         id: resolve
         if: ${{ inputs.mode == 'resume' }}
@@ -157,7 +135,6 @@ jobs:
           echo "Restoring from release: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------------
       - name: Create fresh disk image
         if: ${{ inputs.mode == 'new' }}
         run: |
@@ -167,7 +144,6 @@ jobs:
           sudo mkfs.ext4 -F -m 0 -i 65536 -L workspace "$IMG"
           ls -lh "$IMG"; du -h --apparent-size "$IMG"; du -h "$IMG"
 
-      # ------------------------------------------------------------------
       - name: Restore disk image from release chunks
         if: ${{ inputs.mode == 'resume' }}
         run: |
@@ -221,7 +197,6 @@ jobs:
           echo "Image reassembled:"; ls -lh "$IMG"; du -h "$IMG"
           sudo e2fsck -p -f "$IMG" || true
 
-      # ------------------------------------------------------------------
       - name: Mount image and move Docker onto it
         run: |
           set -euo pipefail
@@ -238,10 +213,6 @@ jobs:
           sudo systemctl start docker
           sudo docker info --format 'Docker Root Dir: {{.DockerRootDir}}'
 
-      # ------------------------------------------------------------------
-      # Runs on BOTH new and resume: rebuilds the image (fast on resume,
-      # mostly cache hits) and always recreates the container fresh so the
-      # current entrypoint is what actually runs.
       - name: Build workspace image and (re)create container
         env:
           VNC_PASSWORD: ${{ inputs.vnc_password }}
@@ -249,19 +220,14 @@ jobs:
           set -euo pipefail
           BUILD=$(mktemp -d)
 
-          # --- embedded pure-Python DES, used only to pre-render the fixed
-          # VNC obfuscation key's key-schedule-independent pieces is overkill
-          # to explain here; see genpasswd.py below for the real logic. ---
           cat > "$BUILD/genpasswd.py" <<'PYEOF'
           #!/usr/bin/env python3
           """Write a TigerVNC-compatible ~/.vnc/passwd file with no external
-          vncpasswd/tigervncpasswd binary (Ubuntu 24.04's tigervnc packages
-          don't ship one). VNC's passwd format: password truncated/null-padded
-          to 8 bytes, DES-ECB encrypted with a fixed, bit-reversed key. This is
-          the standard, publicly documented VNC obfuscation scheme - not
-          real security - implemented here so password-setting can never
-          silently no-op again."""
-          import sys
+          vncpasswd/tigervncpasswd binary (this Ubuntu image ships none).
+          VNC's passwd format: password truncated/null-padded to 8 bytes,
+          DES-ECB encrypted with a fixed, bit-reversed key. Verified
+          byte-for-byte against the `cryptography` library's DES."""
+          import sys, os
 
           PC1 = [56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,
                  62,54,46,38,30,22,14,6,61,53,45,37,29,21,13,5,60,52,44,36,28,20,12,4,27,19,11,3]
@@ -351,7 +317,6 @@ jobs:
                   sys.exit(1)
               with open(outfile, 'wb') as f:
                   f.write(enc)
-              import os
               os.chmod(outfile, 0o600)
               print(f"wrote {len(enc)} byte VNC passwd file to {outfile}")
 
@@ -388,10 +353,8 @@ jobs:
           done
 
           # -------------------------------------------------------------
-          # VNC password. Rewritten from $VNC_PASSWORD on EVERY boot via the
-          # embedded genpasswd.py - no external vncpasswd/tigervncpasswd
-          # binary involved (this Ubuntu image doesn't ship one; that was
-          # the entire cause of every earlier "wrong password" symptom).
+          # VNC password, rewritten from $VNC_PASSWORD on every boot via the
+          # embedded genpasswd.py. No external vncpasswd dependency.
           # -------------------------------------------------------------
           VNC_PW_FILE=/root/.vnc/passwd
           VNC_PW_PLAIN=/root/.vnc/vnc_password.txt
@@ -400,13 +363,12 @@ jobs:
           chmod 600 "$VNC_PW_PLAIN"
 
           if ! python3 /usr/local/bin/genpasswd.py "$VNC_PW" "$VNC_PW_FILE" >>/var/log/genpasswd.log 2>&1; then
-            echo "[entrypoint] FATAL: genpasswd.py failed, see /var/log/genpasswd.log" >&2
+            echo "[entrypoint] FATAL: genpasswd.py failed" >&2
             echo "VNC_PASSWD_FILE_BAD" > /tmp/vnc_error
           fi
           PWSIZE=$(stat -c%s "$VNC_PW_FILE" 2>/dev/null || echo 0)
           echo "[entrypoint] vnc passwd file is ${PWSIZE} bytes" >&2
           if [ "$PWSIZE" -ne 8 ]; then
-            echo "[entrypoint] FATAL: vnc passwd file is not 8 bytes" >&2
             echo "VNC_PASSWD_FILE_BAD" > /tmp/vnc_error
           fi
 
@@ -424,63 +386,56 @@ jobs:
           EOSX
           chmod +x /root/.vnc/xstartup
 
-          rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
-
-          # Xvnc directly, NOT the `vncserver` wrapper (unreliable auth mode
-          # selection on Ubuntu 22.04/24.04's TigerVNC packaging).
-          # -localhost: only websockify reaches raw RFB; browsers use 6081.
-          Xvnc :1 \
-            -geometry 1280x800 -depth 24 \
-            -rfbport "$VNC_PORT" -localhost \
-            -rfbauth "$VNC_PW_FILE" \
-            -SecurityTypes VncAuth \
-            -AlwaysShared -AcceptSetDesktopSize \
-            -desktop devbox \
-            >>/var/log/xvnc.log 2>&1 &
-          XVNC_PID=$!
-
-          export DISPLAY=:1
-          for _ in $(seq 1 30); do
-            xdpyinfo -display :1 >/dev/null 2>&1 && break
-            sleep 1
-          done
-          dbus-launch --exit-with-session /root/.vnc/xstartup \
-            >>/var/log/plasma.log 2>&1 &
-
-          websockify --web=/usr/share/novnc "$NOVNC_PORT" "127.0.0.1:$VNC_PORT" \
-            >>/var/log/websockify.log 2>&1 &
-          WS_PID=$!
-
           # -------------------------------------------------------------
-          # Supervise Xvnc, websockify, and both Cloudflare tunnels as
-          # independent restart loops. If any one dies, only that one
-          # component restarts - no manual intervention should ever be
-          # needed, and there is deliberately no shell hook that lets a
-          # user's own commands kill these out from under the supervisor.
+          # Xvnc and websockify are launched ONLY from inside their own
+          # restart loops - never started once outside and then also
+          # "supervised" via a captured PID. That split previously raced
+          # two Xvnc processes against the same :1 socket lock and
+          # crash-looped the desktop with "server already running".
           # -------------------------------------------------------------
           supervise_xvnc() {
             while true; do
-              wait "$XVNC_PID" 2>/dev/null
-              echo "[entrypoint] Xvnc exited, restarting" >> /var/log/xvnc.log
+              pkill -9 -f 'Xvnc :1' >/dev/null 2>&1 || true
               rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
-              Xvnc :1 -geometry 1280x800 -depth 24 -rfbport "$VNC_PORT" -localhost \
-                -rfbauth "$VNC_PW_FILE" -SecurityTypes VncAuth \
-                -AlwaysShared -AcceptSetDesktopSize -desktop devbox \
-                >>/var/log/xvnc.log 2>&1 &
-              XVNC_PID=$!
+              sleep 1
+              Xvnc :1 \
+                -geometry 1280x800 -depth 24 \
+                -rfbport "$VNC_PORT" -localhost \
+                -rfbauth "$VNC_PW_FILE" \
+                -SecurityTypes VncAuth \
+                -AlwaysShared -AcceptSetDesktopSize \
+                -desktop devbox \
+                >>/var/log/xvnc.log 2>&1
+              CODE=$?
+              echo "[entrypoint] Xvnc exited (code $CODE), restarting" >> /var/log/xvnc.log
               sleep 2
             done
           }
+          supervise_xvnc &
+
+          for _ in $(seq 1 30); do
+            DISPLAY=:1 xdpyinfo >/dev/null 2>&1 && break
+            sleep 1
+          done
+          export DISPLAY=:1
+          dbus-launch --exit-with-session /root/.vnc/xstartup \
+            >>/var/log/plasma.log 2>&1 &
+
           supervise_websockify() {
             while true; do
-              wait "$WS_PID" 2>/dev/null
-              echo "[entrypoint] websockify exited, restarting" >> /var/log/websockify.log
               websockify --web=/usr/share/novnc "$NOVNC_PORT" "127.0.0.1:$VNC_PORT" \
-                >>/var/log/websockify.log 2>&1 &
-              WS_PID=$!
+                >>/var/log/websockify.log 2>&1
+              CODE=$?
+              echo "[entrypoint] websockify exited (code $CODE), restarting" >> /var/log/websockify.log
               sleep 2
             done
           }
+          supervise_websockify &
+
+          # -------------------------------------------------------------
+          # Supervise both Cloudflare quick tunnels the same way: launched
+          # only from inside the loop, no external PID capture.
+          # -------------------------------------------------------------
           supervise_tunnel() {
             local port="$1" urlfile="$2" logfile="$3"
             while true; do
@@ -500,9 +455,6 @@ jobs:
               sleep 3
             done
           }
-
-          supervise_xvnc &
-          supervise_websockify &
           supervise_tunnel "$IDE_PORT"   /tmp/tunnel_url     /var/log/cloudflared.log &
           supervise_tunnel "$NOVNC_PORT" /tmp/vnc_tunnel_url /var/log/cloudflared-vnc.log &
 
@@ -515,7 +467,7 @@ jobs:
           RUN apt-get update && apt-get install -y --no-install-recommends \
                 ca-certificates curl wget git openssh-client sudo nano vim \
                 build-essential python3 python3-pip python3-venv unzip zip \
-                jq htop tmux less locales dumb-init procps \
+                jq htop tmux less locales dumb-init procps psmisc \
                 kde-plasma-desktop plasma-workspace kwin-x11 dolphin konsole \
                 tigervnc-standalone-server tigervnc-common \
                 dbus-x11 x11-xserver-utils x11-utils novnc websockify \
@@ -535,9 +487,7 @@ jobs:
           EOF
 
           sudo docker build -t workspace:latest "$BUILD"
-
           sudo docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-
           sudo docker run -d --name "$CONTAINER" --restart unless-stopped \
             --hostname devbox \
             --shm-size=1g \
@@ -547,7 +497,6 @@ jobs:
             -p 127.0.0.1:${NOVNC_PORT}:6081 \
             workspace:latest
 
-      # ------------------------------------------------------------------
       - name: Publish connection details
         id: connect
         run: |
@@ -561,7 +510,7 @@ jobs:
           done
 
           if sudo docker exec "$CONTAINER" test -f /tmp/vnc_error 2>/dev/null; then
-            echo "::error::VNC password file was not written correctly - see genpasswd.log/xvnc.log below."
+            echo "::error::VNC password file was not written correctly."
             sudo docker exec "$CONTAINER" cat /var/log/genpasswd.log || true
             sudo docker exec "$CONTAINER" tail -n 40 /var/log/xvnc.log || true
           fi
@@ -572,13 +521,14 @@ jobs:
           if [ -z "$VNC_URL" ]; then
             echo "::warning::desktop tunnel not up yet; logs follow."
             sudo docker exec "$CONTAINER" tail -n 50 /var/log/cloudflared-vnc.log || true
-            sudo docker exec "$CONTAINER" tail -n 30 /var/log/xvnc.log || true
+            sudo docker exec "$CONTAINER" tail -n 40 /var/log/xvnc.log || true
           fi
 
           PW=$(sudo docker exec "$CONTAINER" \
                  sed -n 's/^password: //p' /root/.config/code-server/config.yaml || true)
           VNC_PW=$(sudo docker exec "$CONTAINER" cat /root/.vnc/vnc_password.txt 2>/dev/null || true)
           PWSIZE=$(sudo docker exec "$CONTAINER" stat -c%s /root/.vnc/passwd 2>/dev/null || echo 0)
+          XVNC_COUNT=$(sudo docker exec "$CONTAINER" sh -c "pgrep -fc 'Xvnc :1'" 2>/dev/null || echo 0)
           {
             echo "## 🖥️  Workspace is up"
             echo ""
@@ -589,22 +539,19 @@ jobs:
             echo "| Desktop (noVNC) URL | ${VNC_URL:+${VNC_URL}/vnc.html?resize=scale&autoconnect=1} |"
             echo "| Desktop (VNC) password | \`$VNC_PW\` (first 8 chars) |"
             echo "| VNC passwd file | ${PWSIZE} bytes (must be exactly 8) |"
+            echo "| Running Xvnc processes | ${XVNC_COUNT} (must be exactly 1) |"
             echo "| Ports | IDE 8080 · noVNC 6081 · Xvnc 5901 (internal) |"
             echo "| Mode | ${{ inputs.mode }} |"
             REQ=${{ inputs.session_minutes }}
             echo "| Session budget | $(( REQ > 240 || REQ <= 0 ? 240 : REQ )) min (requested: ${REQ}, hard cap: 240) |"
             echo ""
-            echo "Do NOT manually kill Xvnc/websockify/cloudflared from a shell"
-            echo "inside the box - each is on its own restart-loop supervisor;"
-            echo "killing one out from under it is what took a previous session down."
-            echo ""
-            echo "Run \`touch /STOP\` in a terminal inside the IDE to end the"
-            echo "session early and trigger the snapshot immediately."
+            echo "Do not manually kill Xvnc/websockify/cloudflared from a shell"
+            echo "inside the box. Use \`touch /STOP\` in the IDE terminal to end"
+            echo "the session early and trigger the snapshot."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice title=code-server::$URL  (password: $PW)"
           echo "::notice title=desktop (noVNC)::${VNC_URL:-not ready}/vnc.html?resize=scale&autoconnect=1  (password: $VNC_PW)"
 
-      # ------------------------------------------------------------------
       - name: Reset stop switch
         env:
           GH_TOKEN: ${{ github.token }}
@@ -667,7 +614,6 @@ jobs:
             sleep 30
           done
 
-      # ------------------------------------------------------------------
       - name: Quiesce and unmount the image
         if: ${{ always() }}
         run: |
@@ -680,7 +626,6 @@ jobs:
           sudo e2fsck -p -f "$IMG" || true
           echo "apparent: $(du -h --apparent-size "$IMG" | cut -f1)   on-disk: $(du -h "$IMG" | cut -f1)"
 
-      # ------------------------------------------------------------------
       - name: Snapshot to a new release
         if: ${{ always() }}
         run: |
@@ -773,7 +718,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice title=snapshot::$TAG"
 
-      # ------------------------------------------------------------------
       - name: Tear down
         if: ${{ always() }}
         run: |
