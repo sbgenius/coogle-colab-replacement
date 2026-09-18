@@ -234,7 +234,7 @@ jobs:
               rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
               sleep 1
               Xvnc :1 \
-                -geometry 1280x800 -depth 24 \
+                -geometry 1920x1080 -depth 24 \
                 -rfbport "$VNC_PORT" \
                 -SecurityTypes None \
                 -AlwaysShared -AcceptSetDesktopSize \
