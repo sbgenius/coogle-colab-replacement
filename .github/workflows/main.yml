@@ -1,4 +1,4 @@
-name: Code-Server on Ubuntu Runner (ngrok)
+name: Code-Server on Ubuntu Runner VM (ngrok)
 on:
   workflow_dispatch:
     inputs:
@@ -19,16 +19,10 @@ on:
 jobs:
   code-server:
     runs-on: ubuntu-latest
-    container: ubuntu:24.04
     env:
-      WORK_DIR: /root/workspace
+      WORK_DIR: /home/runner/workspace
 
     steps:
-      - name: Install base tooling (curl, git, sudo, ca-certs)
-        run: |
-          apt-get update -y
-          apt-get install -y curl git sudo ca-certificates tar
-
       - name: Create workspace directory
         run: mkdir -p "$WORK_DIR"
 
@@ -40,7 +34,7 @@ jobs:
         run: |
           curl -fsSL -o ngrok.tgz https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
           tar -xvzf ngrok.tgz
-          mv ngrok /usr/local/bin/ngrok
+          sudo mv ngrok /usr/local/bin/ngrok
           ngrok config add-authtoken "${{ github.event.inputs.ngrok_token }}"
 
       - name: Configure code-server
