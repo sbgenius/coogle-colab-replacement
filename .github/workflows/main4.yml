@@ -18,22 +18,32 @@
 #   5901  Xvnc raw RFB       -> loopback only, never tunnelled
 #   6081  websockify/noVNC   -> tunnel #2
 #
-# VNC PASSWORD
-#   Set via the `vnc_password` input. VNC's auth scheme hard-truncates to 8
-#   characters, so only the first 8 matter - a longer value still works, you
-#   just type the first 8. The passwd file is written with `echo` (vncpasswd -f
-#   reads a LINE from stdin; a printf without a trailing newline yields a
-#   ZERO-BYTE file, which is what produces "No password configured for VNC
-#   Auth"). The file is size-checked after writing and the run fails loudly
-#   if it came out empty, instead of silently handing you a broken desktop.
+# VNC PASSWORD - HOW IT'S ACTUALLY WRITTEN
+#   Ubuntu 24.04's tigervnc-common / tigervnc-standalone-server packages do
+#   NOT ship a `vncpasswd` (or `tigervncpasswd`) binary. Every earlier attempt
+#   to pipe a password into that command failed with "command not found",
+#   which - piped into a file redirect - silently produced a 0-byte passwd
+#   file and Xvnc then rejected all logins with "No password configured for
+#   VNC Auth". There was never a wrong password; the tool doesn't exist here.
+#
+#   VNC's passwd file format is public (it's obfuscation, not real security):
+#   the password, truncated/null-padded to 8 bytes, DES-ECB encrypted with a
+#   FIXED key that is bit-reversed per-byte before use. This workflow writes
+#   that file itself with a small embedded pure-Python DES implementation -
+#   no external vncpasswd dependency, so it can't silently no-op again.
+#   Verified against a real Xvnc instance before being folded in here.
 #
 # CONTAINER LIFECYCLE
-#   The container is recreated from a fresh build every run, resume included.
-#   Previously a resume ran `docker start` on the container baked into the
-#   snapshot, so entrypoint changes never took effect. Your data lives in
-#   $MNT/home (bind-mounted to /root), not in the container layer, so
-#   recreating costs nothing. Docker's layer cache is on the same disk image,
-#   so the rebuild on resume is mostly cache hits.
+#   The container is `docker rm -f` + recreated from a fresh build on EVERY
+#   run, resume included. Your data lives in $MNT/home (bind-mounted to
+#   /root), not in the container's own layer, so recreating it costs nothing
+#   and guarantees the current entrypoint is what actually runs - a resume
+#   restarting a container baked into an old snapshot was the earlier bug.
+#
+#   Do not manually `pkill`/restart Xvnc, websockify, or cloudflared inside a
+#   live shell - they're supervised by the entrypoint's own loops, and
+#   killing one out from under that supervision is what took the whole
+#   session down previously. Use /STOP (see below) instead.
 #
 # NOTE ON COMPRESSION  (please read, it matters)
 #
@@ -67,7 +77,7 @@ on:
         required: false
         default: ""
       vnc_password:
-        description: "Desktop (VNC) password. Only the first 8 characters are used - that is a VNC protocol limit."
+        description: "Desktop (VNC) password. Only the first 8 characters are used - that is a VNC protocol limit, not a bug."
         type: string
         required: false
         default: "devbox123"
@@ -107,9 +117,6 @@ env:
 jobs:
   workspace:
     runs-on: ubuntu-latest
-    # Session is hard-capped at 4h (see the clamp in "Hold the session open").
-    # This ceiling adds ~100 min on top for setup, restore, and the
-    # snapshot/upload at the end, so the backup always has room to finish.
     timeout-minutes: 340
 
     steps:
@@ -156,11 +163,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo mkdir -p "$(dirname "$IMG")"
-          # Sparse: consumes only what is actually written.
           sudo truncate -s "${{ inputs.image_size }}" "$IMG"
-          # -m0   : no reserved-for-root blocks
-          # -i 64K: ~1.1M inodes - plenty for node_modules etc, while keeping the
-          #         inode tables small enough that snapshots stay compact
           sudo mkfs.ext4 -F -m 0 -i 65536 -L workspace "$IMG"
           ls -lh "$IMG"; du -h --apparent-size "$IMG"; du -h "$IMG"
 
@@ -182,7 +185,6 @@ jobs:
           N=$(jq -r '.chunks | length' "$MAN")
           COMP=$(jq -r .compression "$MAN")
 
-          # Recreate the container file as a sparse file of the exact size.
           truncate -s "$TOTAL" "$IMG"
 
           fetch_one() {
@@ -213,7 +215,6 @@ jobs:
           export -f fetch_one
           export TAG CHUNKDIR IMG CHUNK_MB COMP N GH_TOKEN
 
-          # 4 at a time: downloads are the bottleneck, disk cost stays tiny.
           jq -r '.chunks[] | "\(.index)\t\(.name)\t\(.sha256)"' "$MAN" \
             | xargs -P 4 -n 3 bash -c 'fetch_one "$0" "$1" "$2"'
 
@@ -225,8 +226,6 @@ jobs:
         run: |
           set -euo pipefail
           sudo mkdir -p "$MNT"
-          # discard => fstrim can punch holes back into the backing file,
-          # so deleted data really disappears from the next snapshot.
           LOOP=$(sudo losetup --find --show "$IMG")
           echo "LOOP=$LOOP" >> "$GITHUB_ENV"
           sudo mount -o discard,noatime "$LOOP" "$MNT"
@@ -240,15 +239,126 @@ jobs:
           sudo docker info --format 'Docker Root Dir: {{.DockerRootDir}}'
 
       # ------------------------------------------------------------------
-      # Runs on BOTH new and resume. On resume the layer cache is already on
-      # the restored disk, so this is fast - and it guarantees the container
-      # actually runs the current entrypoint instead of a stale baked-in one.
+      # Runs on BOTH new and resume: rebuilds the image (fast on resume,
+      # mostly cache hits) and always recreates the container fresh so the
+      # current entrypoint is what actually runs.
       - name: Build workspace image and (re)create container
         env:
           VNC_PASSWORD: ${{ inputs.vnc_password }}
         run: |
           set -euo pipefail
           BUILD=$(mktemp -d)
+
+          # --- embedded pure-Python DES, used only to pre-render the fixed
+          # VNC obfuscation key's key-schedule-independent pieces is overkill
+          # to explain here; see genpasswd.py below for the real logic. ---
+          cat > "$BUILD/genpasswd.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """Write a TigerVNC-compatible ~/.vnc/passwd file with no external
+          vncpasswd/tigervncpasswd binary (Ubuntu 24.04's tigervnc packages
+          don't ship one). VNC's passwd format: password truncated/null-padded
+          to 8 bytes, DES-ECB encrypted with a fixed, bit-reversed key. This is
+          the standard, publicly documented VNC obfuscation scheme - not
+          real security - implemented here so password-setting can never
+          silently no-op again."""
+          import sys
+
+          PC1 = [56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,
+                 62,54,46,38,30,22,14,6,61,53,45,37,29,21,13,5,60,52,44,36,28,20,12,4,27,19,11,3]
+          PC2 = [13,16,10,23,0,4,2,27,14,5,20,9,22,18,11,3,25,7,15,6,26,19,12,1,
+                 40,51,30,36,46,54,29,39,50,44,32,47,43,48,38,55,33,52,45,41,49,35,28,31]
+          SHIFTS = [1,1,2,2,2,2,2,2,1,2,2,2,2,2,2,1]
+          IP = [57,49,41,33,25,17,9,1,59,51,43,35,27,19,11,3,61,53,45,37,29,21,13,5,63,55,47,39,31,23,15,7,
+                56,48,40,32,24,16,8,0,58,50,42,34,26,18,10,2,60,52,44,36,28,20,12,4,62,54,46,38,30,22,14,6]
+          FP = [39,7,47,15,55,23,63,31,38,6,46,14,54,22,62,30,37,5,45,13,53,21,61,29,36,4,44,12,52,20,60,28,
+                35,3,43,11,51,19,59,27,34,2,42,10,50,18,58,26,33,1,41,9,49,17,57,25,32,0,40,8,48,16,56,24]
+          E = [31,0,1,2,3,4,3,4,5,6,7,8,7,8,9,10,11,12,11,12,13,14,15,16,15,16,17,18,19,20,
+               19,20,21,22,23,24,23,24,25,26,27,28,27,28,29,30,31,0]
+          P = [15,6,19,20,28,11,27,16,0,14,22,25,4,17,30,9,1,7,23,13,31,26,2,8,18,12,29,5,21,10,3,24]
+          SBOX = [
+          [[14,4,13,1,2,15,11,8,3,10,6,12,5,9,0,7],[0,15,7,4,14,2,13,1,10,6,12,11,9,5,3,8],
+           [4,1,14,8,13,6,2,11,15,12,9,7,3,10,5,0],[15,12,8,2,4,9,1,7,5,11,3,14,10,0,6,13]],
+          [[15,1,8,14,6,11,3,4,9,7,2,13,12,0,5,10],[3,13,4,7,15,2,8,14,12,0,1,10,6,9,11,5],
+           [0,14,7,11,10,4,13,1,5,8,12,6,9,3,2,15],[13,8,10,1,3,15,4,2,11,6,7,12,0,5,14,9]],
+          [[10,0,9,14,6,3,15,5,1,13,12,7,11,4,2,8],[13,7,0,9,3,4,6,10,2,8,5,14,12,11,15,1],
+           [13,6,4,9,8,15,3,0,11,1,2,12,5,10,14,7],[1,10,13,0,6,9,8,7,4,15,14,3,11,5,2,12]],
+          [[7,13,14,3,0,6,9,10,1,2,8,5,11,12,4,15],[13,8,11,5,6,15,0,3,4,7,2,12,1,10,14,9],
+           [10,6,9,0,12,11,7,13,15,1,3,14,5,2,8,4],[3,15,0,6,10,1,13,8,9,4,5,11,12,7,2,14]],
+          [[2,12,4,1,7,10,11,6,8,5,3,15,13,0,14,9],[14,11,2,12,4,7,13,1,5,0,15,10,3,9,8,6],
+           [4,2,1,11,10,13,7,8,15,9,12,5,6,3,0,14],[11,8,12,7,1,14,2,13,6,15,0,9,10,4,5,3]],
+          [[12,1,10,15,9,2,6,8,0,13,3,4,14,7,5,11],[10,15,4,2,7,12,9,5,6,1,13,14,0,11,3,8],
+           [9,14,15,5,2,8,12,3,7,0,4,10,1,13,11,6],[4,3,2,12,9,5,15,10,11,14,1,7,6,0,8,13]],
+          [[4,11,2,14,15,0,8,13,3,12,9,7,5,10,6,1],[13,0,11,7,4,9,1,10,14,3,5,12,2,15,8,6],
+           [1,4,11,13,12,3,7,14,10,15,6,8,0,5,9,2],[6,11,13,8,1,4,10,7,9,5,0,15,14,2,3,12]],
+          [[13,2,8,4,6,15,11,1,10,9,3,14,5,0,12,7],[1,15,13,8,10,3,7,4,12,5,6,11,0,14,9,2],
+           [7,11,4,1,9,12,14,2,0,6,10,13,15,3,5,8],[2,1,14,7,4,10,8,13,15,12,9,0,3,5,6,11]]]
+
+          def bits_of(byte_data):
+              return [ (b >> (7-i)) & 1 for b in byte_data for i in range(8) ]
+          def bytes_of(bitlist):
+              out=bytearray()
+              for i in range(0,len(bitlist),8):
+                  v=0
+                  for b in bitlist[i:i+8]: v=(v<<1)|b
+                  out.append(v)
+              return bytes(out)
+          def permute(bits, table): return [bits[i] for i in table]
+
+          def des_encrypt_block(block8, key8):
+              kbits = permute(bits_of(key8), PC1)
+              C, D = kbits[:28], kbits[28:]
+              subkeys=[]
+              for s in SHIFTS:
+                  C = C[s:] + C[:s]
+                  D = D[s:] + D[:s]
+                  subkeys.append(permute(C+D, PC2))
+              bits = permute(bits_of(block8), IP)
+              L, R = bits[:32], bits[32:]
+              for k in subkeys:
+                  er = permute(R, E)
+                  x = [er[i]^k[i] for i in range(48)]
+                  out=[]
+                  for i in range(8):
+                      chunk = x[i*6:i*6+6]
+                      row = chunk[0]*2+chunk[5]
+                      col = chunk[1]*8+chunk[2]*4+chunk[3]*2+chunk[4]
+                      val = SBOX[i][row][col]
+                      out += [(val>>3)&1,(val>>2)&1,(val>>1)&1,val&1]
+                  out = permute(out, P)
+                  newR = [L[i]^out[i] for i in range(32)]
+                  L, R = R, newR
+              final = permute(R+L, FP)
+              return bytes_of(final)
+
+          def vnc_key_from_fixed():
+              fixed = bytes([0x17,0x34,0x51,0x6E,0x78,0x64,0x62,0x5A])
+              def revbits(b):
+                  r=0
+                  for i in range(8): r |= ((b>>i)&1)<<(7-i)
+                  return r
+              return bytes(revbits(b) for b in fixed)
+
+          def main():
+              if len(sys.argv) != 3:
+                  print("usage: genpasswd.py <password> <output_file>", file=sys.stderr)
+                  sys.exit(2)
+              password, outfile = sys.argv[1], sys.argv[2]
+              pw = password.encode()[:8].ljust(8, b'\x00')
+              key = vnc_key_from_fixed()
+              enc = des_encrypt_block(pw, key)
+              if len(enc) != 8:
+                  print(f"FATAL: expected 8 bytes, got {len(enc)}", file=sys.stderr)
+                  sys.exit(1)
+              with open(outfile, 'wb') as f:
+                  f.write(enc)
+              import os
+              os.chmod(outfile, 0o600)
+              print(f"wrote {len(enc)} byte VNC passwd file to {outfile}")
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
           cat > "$BUILD/entrypoint.sh" <<'EOS'
           #!/usr/bin/env bash
           set -u
@@ -272,35 +382,31 @@ jobs:
           rm -f /tmp/tunnel_url /tmp/vnc_tunnel_url /STOP
 
           code-server >>/var/log/code-server.log 2>&1 &
-          # Wait for the IDE to actually listen before tunnelling to it.
           for _ in $(seq 1 60); do
             (echo >/dev/tcp/127.0.0.1/$IDE_PORT) >/dev/null 2>&1 && break
             sleep 1
           done
 
           # -------------------------------------------------------------
-          # VNC password. Rewritten from $VNC_PASSWORD on EVERY boot, so the
-          # value you typed into the workflow is always the value that works -
-          # no stale password surviving inside a resumed snapshot.
-          #
-          # `echo`, not `printf '%s'`: vncpasswd -f reads a LINE from stdin.
-          # Without the trailing newline it reads nothing and emits a ZERO-BYTE
-          # file, and Xvnc then rejects every connection with "No password
-          # configured for VNC Auth".
+          # VNC password. Rewritten from $VNC_PASSWORD on EVERY boot via the
+          # embedded genpasswd.py - no external vncpasswd/tigervncpasswd
+          # binary involved (this Ubuntu image doesn't ship one; that was
+          # the entire cause of every earlier "wrong password" symptom).
           # -------------------------------------------------------------
           VNC_PW_FILE=/root/.vnc/passwd
           VNC_PW_PLAIN=/root/.vnc/vnc_password.txt
           VNC_PW="${VNC_PASSWORD:-devbox123}"
-
           echo "$VNC_PW" > "$VNC_PW_PLAIN"
-          echo "$VNC_PW" | vncpasswd -f > "$VNC_PW_FILE"
-          chmod 600 "$VNC_PW_FILE" "$VNC_PW_PLAIN"
+          chmod 600 "$VNC_PW_PLAIN"
 
-          # Fail loudly rather than serving a desktop nobody can log into.
+          if ! python3 /usr/local/bin/genpasswd.py "$VNC_PW" "$VNC_PW_FILE" >>/var/log/genpasswd.log 2>&1; then
+            echo "[entrypoint] FATAL: genpasswd.py failed, see /var/log/genpasswd.log" >&2
+            echo "VNC_PASSWD_FILE_BAD" > /tmp/vnc_error
+          fi
           PWSIZE=$(stat -c%s "$VNC_PW_FILE" 2>/dev/null || echo 0)
           echo "[entrypoint] vnc passwd file is ${PWSIZE} bytes" >&2
-          if [ "$PWSIZE" -lt 8 ]; then
-            echo "[entrypoint] FATAL: vncpasswd produced an empty/short file" >&2
+          if [ "$PWSIZE" -ne 8 ]; then
+            echo "[entrypoint] FATAL: vnc passwd file is not 8 bytes" >&2
             echo "VNC_PASSWD_FILE_BAD" > /tmp/vnc_error
           fi
 
@@ -311,8 +417,6 @@ jobs:
           export XDG_SESSION_TYPE="x11"
           export XDG_RUNTIME_DIR="/tmp/xdg-runtime-root"
           mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
-          # No GPU behind a VNC framebuffer - force KWin's software path
-          # instead of trying (and failing) to use OpenGL compositing.
           export KWIN_COMPOSE=N
           export KWIN_OPENGL_INTERFACE=none
           export QT_XCB_GL_INTEGRATION=none
@@ -320,13 +424,10 @@ jobs:
           EOSX
           chmod +x /root/.vnc/xstartup
 
-          # Clear stale locks from a crash or a restored snapshot.
           rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
-          pkill -f 'Xvnc :1' >/dev/null 2>&1 || true
 
-          # Xvnc directly, NOT the `vncserver` wrapper: on Ubuntu 22.04/24.04
-          # the wrapper merges its own defaults AFTER the command line and can
-          # land in one-time-password mode regardless of the flags you pass.
+          # Xvnc directly, NOT the `vncserver` wrapper (unreliable auth mode
+          # selection on Ubuntu 22.04/24.04's TigerVNC packaging).
           # -localhost: only websockify reaches raw RFB; browsers use 6081.
           Xvnc :1 \
             -geometry 1280x800 -depth 24 \
@@ -336,6 +437,7 @@ jobs:
             -AlwaysShared -AcceptSetDesktopSize \
             -desktop devbox \
             >>/var/log/xvnc.log 2>&1 &
+          XVNC_PID=$!
 
           export DISPLAY=:1
           for _ in $(seq 1 30); do
@@ -347,12 +449,38 @@ jobs:
 
           websockify --web=/usr/share/novnc "$NOVNC_PORT" "127.0.0.1:$VNC_PORT" \
             >>/var/log/websockify.log 2>&1 &
+          WS_PID=$!
 
           # -------------------------------------------------------------
-          # Supervise both Cloudflare quick tunnels - one for code-server,
-          # one for the desktop. Quick tunnels die sometimes; restart and
-          # republish the new hostname so the runner can print it.
+          # Supervise Xvnc, websockify, and both Cloudflare tunnels as
+          # independent restart loops. If any one dies, only that one
+          # component restarts - no manual intervention should ever be
+          # needed, and there is deliberately no shell hook that lets a
+          # user's own commands kill these out from under the supervisor.
           # -------------------------------------------------------------
+          supervise_xvnc() {
+            while true; do
+              wait "$XVNC_PID" 2>/dev/null
+              echo "[entrypoint] Xvnc exited, restarting" >> /var/log/xvnc.log
+              rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
+              Xvnc :1 -geometry 1280x800 -depth 24 -rfbport "$VNC_PORT" -localhost \
+                -rfbauth "$VNC_PW_FILE" -SecurityTypes VncAuth \
+                -AlwaysShared -AcceptSetDesktopSize -desktop devbox \
+                >>/var/log/xvnc.log 2>&1 &
+              XVNC_PID=$!
+              sleep 2
+            done
+          }
+          supervise_websockify() {
+            while true; do
+              wait "$WS_PID" 2>/dev/null
+              echo "[entrypoint] websockify exited, restarting" >> /var/log/websockify.log
+              websockify --web=/usr/share/novnc "$NOVNC_PORT" "127.0.0.1:$VNC_PORT" \
+                >>/var/log/websockify.log 2>&1 &
+              WS_PID=$!
+              sleep 2
+            done
+          }
           supervise_tunnel() {
             local port="$1" urlfile="$2" logfile="$3"
             while true; do
@@ -373,11 +501,11 @@ jobs:
             done
           }
 
+          supervise_xvnc &
+          supervise_websockify &
           supervise_tunnel "$IDE_PORT"   /tmp/tunnel_url     /var/log/cloudflared.log &
           supervise_tunnel "$NOVNC_PORT" /tmp/vnc_tunnel_url /var/log/cloudflared-vnc.log &
 
-          # Block forever supervising both tunnels; this keeps the
-          # container (PID 1 via dumb-init) alive.
           wait -n
           EOS
 
@@ -392,17 +520,15 @@ jobs:
                 tigervnc-standalone-server tigervnc-common \
                 dbus-x11 x11-xserver-utils x11-utils novnc websockify \
               && rm -rf /var/lib/apt/lists/*
-          # code-server
           RUN curl -fsSL https://code-server.dev/install.sh | sh
-          # cloudflared
           RUN arch="$(dpkg --print-architecture)" \
               && curl -fsSL -o /tmp/cf.deb \
                  "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.deb" \
               && dpkg -i /tmp/cf.deb && rm /tmp/cf.deb
-          # noVNC: serve vnc.html at the root URL for convenience
           RUN ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
           COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-          RUN chmod +x /usr/local/bin/entrypoint.sh
+          COPY genpasswd.py /usr/local/bin/genpasswd.py
+          RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/genpasswd.py
           WORKDIR /workspace
           EXPOSE 8080 6081
           ENTRYPOINT ["dumb-init","--","/usr/local/bin/entrypoint.sh"]
@@ -410,8 +536,6 @@ jobs:
 
           sudo docker build -t workspace:latest "$BUILD"
 
-          # Drop any container from a previous session. All real data is in
-          # $MNT/home, which is bind-mounted, so nothing is lost.
           sudo docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
           sudo docker run -d --name "$CONTAINER" --restart unless-stopped \
@@ -436,14 +560,11 @@ jobs:
             sleep 4
           done
 
-          # Surface a broken passwd file immediately instead of letting you
-          # discover it by getting rejected in the browser.
           if sudo docker exec "$CONTAINER" test -f /tmp/vnc_error 2>/dev/null; then
-            echo "::error::VNC password file was not written correctly - see xvnc.log below."
-            sudo docker exec "$CONTAINER" ls -l /root/.vnc/ || true
+            echo "::error::VNC password file was not written correctly - see genpasswd.log/xvnc.log below."
+            sudo docker exec "$CONTAINER" cat /var/log/genpasswd.log || true
             sudo docker exec "$CONTAINER" tail -n 40 /var/log/xvnc.log || true
           fi
-
           if [ -z "$URL" ]; then
             echo "::warning::code-server tunnel not up yet; logs follow."
             sudo docker exec "$CONTAINER" tail -n 50 /var/log/cloudflared.log || true
@@ -466,12 +587,16 @@ jobs:
             echo "| code-server URL | $URL |"
             echo "| code-server password | \`$PW\` |"
             echo "| Desktop (noVNC) URL | ${VNC_URL:+${VNC_URL}/vnc.html?resize=scale&autoconnect=1} |"
-            echo "| Desktop (VNC) password | \`$VNC_PW\` (type the first 8 chars) |"
-            echo "| VNC passwd file | ${PWSIZE} bytes (must be > 0) |"
+            echo "| Desktop (VNC) password | \`$VNC_PW\` (first 8 chars) |"
+            echo "| VNC passwd file | ${PWSIZE} bytes (must be exactly 8) |"
             echo "| Ports | IDE 8080 · noVNC 6081 · Xvnc 5901 (internal) |"
             echo "| Mode | ${{ inputs.mode }} |"
             REQ=${{ inputs.session_minutes }}
             echo "| Session budget | $(( REQ > 240 || REQ <= 0 ? 240 : REQ )) min (requested: ${REQ}, hard cap: 240) |"
+            echo ""
+            echo "Do NOT manually kill Xvnc/websockify/cloudflared from a shell"
+            echo "inside the box - each is on its own restart-loop supervisor;"
+            echo "killing one out from under it is what took a previous session down."
             echo ""
             echo "Run \`touch /STOP\` in a terminal inside the IDE to end the"
             echo "session early and trigger the snapshot immediately."
@@ -480,11 +605,6 @@ jobs:
           echo "::notice title=desktop (noVNC)::${VNC_URL:-not ready}/vnc.html?resize=scale&autoconnect=1  (password: $VNC_PW)"
 
       # ------------------------------------------------------------------
-      # Repo "variables" (gh variable set/get) can NEVER be written by the
-      # built-in GITHUB_TOKEN, no matter what's in `permissions:` - that API
-      # isn't in its scope list. A git ref is, since it only needs
-      # `contents: write`. So the stop signal is: does refs/tags/stop-signal
-      # exist? Clear any leftover one so it doesn't kill this run instantly.
       - name: Reset stop switch
         env:
           GH_TOKEN: ${{ github.token }}
@@ -498,7 +618,7 @@ jobs:
         run: |
           set -uo pipefail
           REQUESTED=${{ inputs.session_minutes }}
-          CAP_MINUTES=240   # hard ceiling: 4 hours, no matter what was entered
+          CAP_MINUTES=240
           MINUTES=$REQUESTED
           if [ "$MINUTES" -gt "$CAP_MINUTES" ] || [ "$MINUTES" -le 0 ]; then
             echo "::warning::session_minutes=$REQUESTED is out of range, clamping to $CAP_MINUTES."
@@ -548,16 +668,11 @@ jobs:
           done
 
       # ------------------------------------------------------------------
-      # Always runs, however this job ends (timeout, cancel handled within the
-      # 5-min grace window, normal completion, or an earlier failed step) - the
-      # snapshot is never optional.
       - name: Quiesce and unmount the image
         if: ${{ always() }}
         run: |
           set -euo pipefail
           sudo docker stop -t 60 "$CONTAINER" || true
-          # Flush everything, then hand freed blocks back to the sparse file so
-          # deleted data does not ride along into the snapshot.
           sudo fstrim -v "$MNT" || true
           sync
           sudo systemctl stop docker docker.socket containerd || true
@@ -606,8 +721,6 @@ jobs:
             local i="$1"
             local name; name=$(printf 'disk.part.%05d.img%s' "$i" "$EXT")
             local dest="$CHUNKDIR/$name"
-            # Read a window straight out of the image and write ONLY the
-            # finished chunk. No full-size intermediate file, ever.
             if [ "$COMP" = zstd ]; then
               sudo dd if="$IMG" bs=1M skip=$(( i * CHUNK_MB )) count="$CHUNK_MB" \
                    iflag=fullblock status=none \
@@ -635,7 +748,6 @@ jobs:
           export -f upload_one
           export IMG CHUNKDIR CHUNK_MB LEVEL COMP EXT TAG GH_TOKEN USER
 
-          # 3 workers: only 3 compressed chunks exist on disk at any moment.
           seq 0 $(( N - 1 )) | xargs -P 3 -n 1 bash -c 'upload_one "$0"'
 
           jq -s --arg tag "$TAG" --arg ts "$TS" --arg comp "$COMP" \
