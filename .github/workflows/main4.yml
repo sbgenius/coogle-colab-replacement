@@ -32,7 +32,7 @@
 # Set `compress_level: 0` if you truly want raw chunks.
 # ---------------------------------------------------------------------------
 
-name: Persistent Workspace 2
+name: Persistent Workspace kde mod
 
 on:
   workflow_dispatch:
