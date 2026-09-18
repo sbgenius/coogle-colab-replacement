@@ -1,4 +1,4 @@
-name: Code-Server on Ubuntu Runner VM (ngrok)
+name: Code-Server on Ubuntu Runner (ngrok)
 on:
   workflow_dispatch:
     inputs:
@@ -20,12 +20,9 @@ jobs:
   code-server:
     runs-on: ubuntu-latest
     env:
-      WORK_DIR: /home/runner/workspace
+      WORK_DIR: /home/runner/root
 
     steps:
-      - name: Create workspace directory
-        run: mkdir -p "$WORK_DIR"
-
       - name: Install code-server
         run: |
           curl -fsSL https://code-server.dev/install.sh | sh
@@ -56,8 +53,9 @@ jobs:
           }
           EOF
 
-      - name: Start code-server (background)
+      - name: Start code-server (background, opened in root repo)
         run: |
+          mkdir -p "$WORK_DIR"
           cd "$WORK_DIR"
           nohup code-server --bind-addr 127.0.0.1:8080 "$WORK_DIR" > "$HOME/code-server.log" 2>&1 &
           sleep 10
