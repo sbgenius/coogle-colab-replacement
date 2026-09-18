@@ -1,50 +1,15 @@
 # .github/workflows/persistent-workspace.yml
 #
-# Persistent cloud dev box on GitHub Actions.
-#
-#   * All work lives inside ONE sparse disk-image file (ext4 on a loop device).
-#   * Docker's data-root is moved onto that image, so every container, layer,
-#     volume and byte you create lands inside the image.
-#   * At the end of the session the image is sliced into fixed-offset chunks and
-#     pushed to a brand-new GitHub Release as assets, with a manifest.
-#   * Next run you pick "resume", the chunks are pulled back, the image is
-#     reassembled in place, and you carry on where you left off.
-#   * code-server + Cloudflare quick tunnel  -> browser IDE.
-#   * KDE Plasma (Xvnc + noVNC) + its own tunnel -> full graphical desktop.
-#
-# ---------------------------------------------------------------------------
-# PORTS (all distinct, on purpose)
-#   8080  code-server        -> tunnel #1
-#   5901  Xvnc raw RFB       -> loopback only, never tunnelled
-#   6081  websockify/noVNC   -> tunnel #2
-#
-# VNC PASSWORD
-#   Ubuntu 24.04's tigervnc packages ship no `vncpasswd`/`tigervncpasswd`
-#   binary. The passwd file is written by an embedded pure-Python DES
-#   routine (genpasswd.py) implementing VNC's standard fixed-key DES-ECB
-#   obfuscation. Verified byte-for-byte against the `cryptography` library.
-#
-# XVNC / WEBSOCKIFY SUPERVISION
-#   Each is launched exactly once, from inside its own restart loop - never
-#   started once outside the loop and then also "supervised" via a captured
-#   PID. An earlier version did the latter, which raced two Xvnc instances
-#   against the same :1 display/socket lock and crash-looped the desktop.
-#   Do not manually kill these processes from a shell inside the box; let
-#   the loops handle restarts, or use /STOP to end the whole session.
-#
-# CONTAINER LIFECYCLE
-#   The container is `docker rm -f` + recreated from a fresh build on EVERY
-#   run, resume included, so entrypoint changes always take effect. Data
-#   lives in $MNT/home (bind-mounted to /root), so recreating the container
-#   costs nothing.
-#
-# NOTE ON COMPRESSION
-#   Never makes a second copy of the image: each chunk is read straight out
-#   with dd and piped into zstd, so only the finished (small) chunk ever
-#   hits disk. Set compress_level: 0 for raw chunks.
+# TEMPORARY DEBUG VARIANT: VNC auth is disabled (-SecurityTypes None).
+# This is ONLY to isolate whether the "Authentication failure" was a real
+# password mismatch or something upstream (websockify/tunnel) misbehaving.
+# The noVNC URL is unauthenticated and reachable by anyone who has the link
+# for as long as the session runs - do not leave this running unattended,
+# and do not put anything sensitive in the desktop session while using it.
+# Revert to password auth once we've confirmed what's actually happening.
 # ---------------------------------------------------------------------------
 
-name: Persistent Workspace kde mod
+name: Persistent Workspace kde mod (DEBUG - no VNC auth)
 
 on:
   workflow_dispatch:
@@ -62,13 +27,8 @@ on:
         type: string
         required: false
         default: ""
-      vnc_password:
-        description: "Desktop (VNC) password. Only the first 8 characters are used - VNC protocol limit."
-        type: string
-        required: false
-        default: "devbox123"
       session_minutes:
-        description: "How long to keep the box alive before snapshotting. Hard-capped at 240 (4h) no matter what you enter here."
+        description: "How long to keep the box alive before snapshotting. Hard-capped at 240 (4h)."
         type: string
         required: false
         default: "240"
@@ -214,115 +174,9 @@ jobs:
           sudo docker info --format 'Docker Root Dir: {{.DockerRootDir}}'
 
       - name: Build workspace image and (re)create container
-        env:
-          VNC_PASSWORD: ${{ inputs.vnc_password }}
         run: |
           set -euo pipefail
           BUILD=$(mktemp -d)
-
-          cat > "$BUILD/genpasswd.py" <<'PYEOF'
-          #!/usr/bin/env python3
-          """Write a TigerVNC-compatible ~/.vnc/passwd file with no external
-          vncpasswd/tigervncpasswd binary (this Ubuntu image ships none).
-          VNC's passwd format: password truncated/null-padded to 8 bytes,
-          DES-ECB encrypted with a fixed, bit-reversed key. Verified
-          byte-for-byte against the `cryptography` library's DES."""
-          import sys, os
-
-          PC1 = [56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,
-                 62,54,46,38,30,22,14,6,61,53,45,37,29,21,13,5,60,52,44,36,28,20,12,4,27,19,11,3]
-          PC2 = [13,16,10,23,0,4,2,27,14,5,20,9,22,18,11,3,25,7,15,6,26,19,12,1,
-                 40,51,30,36,46,54,29,39,50,44,32,47,43,48,38,55,33,52,45,41,49,35,28,31]
-          SHIFTS = [1,1,2,2,2,2,2,2,1,2,2,2,2,2,2,1]
-          IP = [57,49,41,33,25,17,9,1,59,51,43,35,27,19,11,3,61,53,45,37,29,21,13,5,63,55,47,39,31,23,15,7,
-                56,48,40,32,24,16,8,0,58,50,42,34,26,18,10,2,60,52,44,36,28,20,12,4,62,54,46,38,30,22,14,6]
-          FP = [39,7,47,15,55,23,63,31,38,6,46,14,54,22,62,30,37,5,45,13,53,21,61,29,36,4,44,12,52,20,60,28,
-                35,3,43,11,51,19,59,27,34,2,42,10,50,18,58,26,33,1,41,9,49,17,57,25,32,0,40,8,48,16,56,24]
-          E = [31,0,1,2,3,4,3,4,5,6,7,8,7,8,9,10,11,12,11,12,13,14,15,16,15,16,17,18,19,20,
-               19,20,21,22,23,24,23,24,25,26,27,28,27,28,29,30,31,0]
-          P = [15,6,19,20,28,11,27,16,0,14,22,25,4,17,30,9,1,7,23,13,31,26,2,8,18,12,29,5,21,10,3,24]
-          SBOX = [
-          [[14,4,13,1,2,15,11,8,3,10,6,12,5,9,0,7],[0,15,7,4,14,2,13,1,10,6,12,11,9,5,3,8],
-           [4,1,14,8,13,6,2,11,15,12,9,7,3,10,5,0],[15,12,8,2,4,9,1,7,5,11,3,14,10,0,6,13]],
-          [[15,1,8,14,6,11,3,4,9,7,2,13,12,0,5,10],[3,13,4,7,15,2,8,14,12,0,1,10,6,9,11,5],
-           [0,14,7,11,10,4,13,1,5,8,12,6,9,3,2,15],[13,8,10,1,3,15,4,2,11,6,7,12,0,5,14,9]],
-          [[10,0,9,14,6,3,15,5,1,13,12,7,11,4,2,8],[13,7,0,9,3,4,6,10,2,8,5,14,12,11,15,1],
-           [13,6,4,9,8,15,3,0,11,1,2,12,5,10,14,7],[1,10,13,0,6,9,8,7,4,15,14,3,11,5,2,12]],
-          [[7,13,14,3,0,6,9,10,1,2,8,5,11,12,4,15],[13,8,11,5,6,15,0,3,4,7,2,12,1,10,14,9],
-           [10,6,9,0,12,11,7,13,15,1,3,14,5,2,8,4],[3,15,0,6,10,1,13,8,9,4,5,11,12,7,2,14]],
-          [[2,12,4,1,7,10,11,6,8,5,3,15,13,0,14,9],[14,11,2,12,4,7,13,1,5,0,15,10,3,9,8,6],
-           [4,2,1,11,10,13,7,8,15,9,12,5,6,3,0,14],[11,8,12,7,1,14,2,13,6,15,0,9,10,4,5,3]],
-          [[12,1,10,15,9,2,6,8,0,13,3,4,14,7,5,11],[10,15,4,2,7,12,9,5,6,1,13,14,0,11,3,8],
-           [9,14,15,5,2,8,12,3,7,0,4,10,1,13,11,6],[4,3,2,12,9,5,15,10,11,14,1,7,6,0,8,13]],
-          [[4,11,2,14,15,0,8,13,3,12,9,7,5,10,6,1],[13,0,11,7,4,9,1,10,14,3,5,12,2,15,8,6],
-           [1,4,11,13,12,3,7,14,10,15,6,8,0,5,9,2],[6,11,13,8,1,4,10,7,9,5,0,15,14,2,3,12]],
-          [[13,2,8,4,6,15,11,1,10,9,3,14,5,0,12,7],[1,15,13,8,10,3,7,4,12,5,6,11,0,14,9,2],
-           [7,11,4,1,9,12,14,2,0,6,10,13,15,3,5,8],[2,1,14,7,4,10,8,13,15,12,9,0,3,5,6,11]]]
-
-          def bits_of(byte_data):
-              return [ (b >> (7-i)) & 1 for b in byte_data for i in range(8) ]
-          def bytes_of(bitlist):
-              out=bytearray()
-              for i in range(0,len(bitlist),8):
-                  v=0
-                  for b in bitlist[i:i+8]: v=(v<<1)|b
-                  out.append(v)
-              return bytes(out)
-          def permute(bits, table): return [bits[i] for i in table]
-
-          def des_encrypt_block(block8, key8):
-              kbits = permute(bits_of(key8), PC1)
-              C, D = kbits[:28], kbits[28:]
-              subkeys=[]
-              for s in SHIFTS:
-                  C = C[s:] + C[:s]
-                  D = D[s:] + D[:s]
-                  subkeys.append(permute(C+D, PC2))
-              bits = permute(bits_of(block8), IP)
-              L, R = bits[:32], bits[32:]
-              for k in subkeys:
-                  er = permute(R, E)
-                  x = [er[i]^k[i] for i in range(48)]
-                  out=[]
-                  for i in range(8):
-                      chunk = x[i*6:i*6+6]
-                      row = chunk[0]*2+chunk[5]
-                      col = chunk[1]*8+chunk[2]*4+chunk[3]*2+chunk[4]
-                      val = SBOX[i][row][col]
-                      out += [(val>>3)&1,(val>>2)&1,(val>>1)&1,val&1]
-                  out = permute(out, P)
-                  newR = [L[i]^out[i] for i in range(32)]
-                  L, R = R, newR
-              final = permute(R+L, FP)
-              return bytes_of(final)
-
-          def vnc_key_from_fixed():
-              fixed = bytes([0x17,0x34,0x51,0x6E,0x78,0x64,0x62,0x5A])
-              def revbits(b):
-                  r=0
-                  for i in range(8): r |= ((b>>i)&1)<<(7-i)
-                  return r
-              return bytes(revbits(b) for b in fixed)
-
-          def main():
-              if len(sys.argv) != 3:
-                  print("usage: genpasswd.py <password> <output_file>", file=sys.stderr)
-                  sys.exit(2)
-              password, outfile = sys.argv[1], sys.argv[2]
-              pw = password.encode()[:8].ljust(8, b'\x00')
-              key = vnc_key_from_fixed()
-              enc = des_encrypt_block(pw, key)
-              if len(enc) != 8:
-                  print(f"FATAL: expected 8 bytes, got {len(enc)}", file=sys.stderr)
-                  sys.exit(1)
-              with open(outfile, 'wb') as f:
-                  f.write(enc)
-              os.chmod(outfile, 0o600)
-              print(f"wrote {len(enc)} byte VNC passwd file to {outfile}")
-
-          if __name__ == "__main__":
-              main()
-          PYEOF
 
           cat > "$BUILD/entrypoint.sh" <<'EOS'
           #!/usr/bin/env bash
@@ -352,26 +206,6 @@ jobs:
             sleep 1
           done
 
-          # -------------------------------------------------------------
-          # VNC password, rewritten from $VNC_PASSWORD on every boot via the
-          # embedded genpasswd.py. No external vncpasswd dependency.
-          # -------------------------------------------------------------
-          VNC_PW_FILE=/root/.vnc/passwd
-          VNC_PW_PLAIN=/root/.vnc/vnc_password.txt
-          VNC_PW="${VNC_PASSWORD:-devbox123}"
-          echo "$VNC_PW" > "$VNC_PW_PLAIN"
-          chmod 600 "$VNC_PW_PLAIN"
-
-          if ! python3 /usr/local/bin/genpasswd.py "$VNC_PW" "$VNC_PW_FILE" >>/var/log/genpasswd.log 2>&1; then
-            echo "[entrypoint] FATAL: genpasswd.py failed" >&2
-            echo "VNC_PASSWD_FILE_BAD" > /tmp/vnc_error
-          fi
-          PWSIZE=$(stat -c%s "$VNC_PW_FILE" 2>/dev/null || echo 0)
-          echo "[entrypoint] vnc passwd file is ${PWSIZE} bytes" >&2
-          if [ "$PWSIZE" -ne 8 ]; then
-            echo "VNC_PASSWD_FILE_BAD" > /tmp/vnc_error
-          fi
-
           cat > /root/.vnc/xstartup <<'EOSX'
           #!/bin/sh
           unset SESSION_MANAGER
@@ -387,11 +221,12 @@ jobs:
           chmod +x /root/.vnc/xstartup
 
           # -------------------------------------------------------------
-          # Xvnc and websockify are launched ONLY from inside their own
-          # restart loops - never started once outside and then also
-          # "supervised" via a captured PID. That split previously raced
-          # two Xvnc processes against the same :1 socket lock and
-          # crash-looped the desktop with "server already running".
+          # DEBUG: -SecurityTypes None means NO password, NO auth at all.
+          # Also dropping -localhost so nothing about loopback/peer-cred
+          # checks can interfere - websockify connects freely.
+          # This is purely to prove whether the earlier "Authentication
+          # failure" was a real credential mismatch or a websockify/Xvnc
+          # negotiation issue unrelated to the password.
           # -------------------------------------------------------------
           supervise_xvnc() {
             while true; do
@@ -400,9 +235,8 @@ jobs:
               sleep 1
               Xvnc :1 \
                 -geometry 1280x800 -depth 24 \
-                -rfbport "$VNC_PORT" -localhost \
-                -rfbauth "$VNC_PW_FILE" \
-                -SecurityTypes VncAuth \
+                -rfbport "$VNC_PORT" \
+                -SecurityTypes None \
                 -AlwaysShared -AcceptSetDesktopSize \
                 -desktop devbox \
                 >>/var/log/xvnc.log 2>&1
@@ -432,10 +266,6 @@ jobs:
           }
           supervise_websockify &
 
-          # -------------------------------------------------------------
-          # Supervise both Cloudflare quick tunnels the same way: launched
-          # only from inside the loop, no external PID capture.
-          # -------------------------------------------------------------
           supervise_tunnel() {
             local port="$1" urlfile="$2" logfile="$3"
             while true; do
@@ -479,8 +309,7 @@ jobs:
               && dpkg -i /tmp/cf.deb && rm /tmp/cf.deb
           RUN ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
           COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-          COPY genpasswd.py /usr/local/bin/genpasswd.py
-          RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/genpasswd.py
+          RUN chmod +x /usr/local/bin/entrypoint.sh
           WORKDIR /workspace
           EXPOSE 8080 6081
           ENTRYPOINT ["dumb-init","--","/usr/local/bin/entrypoint.sh"]
@@ -491,7 +320,6 @@ jobs:
           sudo docker run -d --name "$CONTAINER" --restart unless-stopped \
             --hostname devbox \
             --shm-size=1g \
-            -e VNC_PASSWORD="$VNC_PASSWORD" \
             -v "$MNT/home:/root" \
             -p 127.0.0.1:${IDE_PORT}:8080 \
             -p 127.0.0.1:${NOVNC_PORT}:6081 \
@@ -508,49 +336,24 @@ jobs:
             [ -n "$URL" ] && [ -n "$VNC_URL" ] && break
             sleep 4
           done
-
-          if sudo docker exec "$CONTAINER" test -f /tmp/vnc_error 2>/dev/null; then
-            echo "::error::VNC password file was not written correctly."
-            sudo docker exec "$CONTAINER" cat /var/log/genpasswd.log || true
-            sudo docker exec "$CONTAINER" tail -n 40 /var/log/xvnc.log || true
-          fi
-          if [ -z "$URL" ]; then
-            echo "::warning::code-server tunnel not up yet; logs follow."
-            sudo docker exec "$CONTAINER" tail -n 50 /var/log/cloudflared.log || true
-          fi
-          if [ -z "$VNC_URL" ]; then
-            echo "::warning::desktop tunnel not up yet; logs follow."
-            sudo docker exec "$CONTAINER" tail -n 50 /var/log/cloudflared-vnc.log || true
-            sudo docker exec "$CONTAINER" tail -n 40 /var/log/xvnc.log || true
-          fi
-
           PW=$(sudo docker exec "$CONTAINER" \
                  sed -n 's/^password: //p' /root/.config/code-server/config.yaml || true)
-          VNC_PW=$(sudo docker exec "$CONTAINER" cat /root/.vnc/vnc_password.txt 2>/dev/null || true)
-          PWSIZE=$(sudo docker exec "$CONTAINER" stat -c%s /root/.vnc/passwd 2>/dev/null || echo 0)
           XVNC_COUNT=$(sudo docker exec "$CONTAINER" sh -c "pgrep -fc 'Xvnc :1'" 2>/dev/null || echo 0)
           {
-            echo "## 🖥️  Workspace is up"
+            echo "## 🖥️  Workspace is up (DEBUG - VNC has NO password)"
             echo ""
             echo "| | |"
             echo "|---|---|"
             echo "| code-server URL | $URL |"
             echo "| code-server password | \`$PW\` |"
             echo "| Desktop (noVNC) URL | ${VNC_URL:+${VNC_URL}/vnc.html?resize=scale&autoconnect=1} |"
-            echo "| Desktop (VNC) password | \`$VNC_PW\` (first 8 chars) |"
-            echo "| VNC passwd file | ${PWSIZE} bytes (must be exactly 8) |"
+            echo "| Desktop auth | **NONE - anyone with the link can connect** |"
             echo "| Running Xvnc processes | ${XVNC_COUNT} (must be exactly 1) |"
-            echo "| Ports | IDE 8080 · noVNC 6081 · Xvnc 5901 (internal) |"
             echo "| Mode | ${{ inputs.mode }} |"
-            REQ=${{ inputs.session_minutes }}
-            echo "| Session budget | $(( REQ > 240 || REQ <= 0 ? 240 : REQ )) min (requested: ${REQ}, hard cap: 240) |"
-            echo ""
-            echo "Do not manually kill Xvnc/websockify/cloudflared from a shell"
-            echo "inside the box. Use \`touch /STOP\` in the IDE terminal to end"
-            echo "the session early and trigger the snapshot."
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning title=NO AUTH::Desktop tunnel has no password. Debug build only."
           echo "::notice title=code-server::$URL  (password: $PW)"
-          echo "::notice title=desktop (noVNC)::${VNC_URL:-not ready}/vnc.html?resize=scale&autoconnect=1  (password: $VNC_PW)"
+          echo "::notice title=desktop (noVNC, NO AUTH)::${VNC_URL:-not ready}/vnc.html?resize=scale&autoconnect=1"
 
       - name: Reset stop switch
         env:
@@ -559,7 +362,6 @@ jobs:
           set -euo pipefail
           gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/stop-signal" \
             >/dev/null 2>&1 || true
-          echo "Cleared any stale stop-signal tag."
 
       - name: Hold the session open
         run: |
@@ -568,19 +370,15 @@ jobs:
           CAP_MINUTES=240
           MINUTES=$REQUESTED
           if [ "$MINUTES" -gt "$CAP_MINUTES" ] || [ "$MINUTES" -le 0 ]; then
-            echo "::warning::session_minutes=$REQUESTED is out of range, clamping to $CAP_MINUTES."
             MINUTES=$CAP_MINUTES
           fi
           BUDGET=$(( MINUTES * 60 ))
           START=$(date +%s)
-          LAST_URL=$(sudo docker exec "$CONTAINER" cat /tmp/tunnel_url 2>/dev/null || true)
-          LAST_VNC_URL=$(sudo docker exec "$CONTAINER" cat /tmp/vnc_tunnel_url 2>/dev/null || true)
           while true; do
             NOW=$(date +%s); ELAPSED=$(( NOW - START ))
             [ "$ELAPSED" -ge "$BUDGET" ] && { echo "Session budget reached."; break; }
-
             if sudo docker exec "$CONTAINER" test -f /STOP 2>/dev/null; then
-              echo "/STOP found inside the container - wrapping up early."
+              echo "/STOP found - wrapping up early."
               break
             fi
             if gh api "repos/${{ github.repository }}/git/refs/tags/stop-signal" >/dev/null 2>&1; then
@@ -588,28 +386,10 @@ jobs:
               break
             fi
             if ! sudo docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-              echo "::warning::Container is gone, restarting it."
               sudo docker start "$CONTAINER" || true
             fi
-
-            URL=$(sudo docker exec "$CONTAINER" cat /tmp/tunnel_url 2>/dev/null || true)
-            if [ -n "$URL" ] && [ "$URL" != "$LAST_URL" ]; then
-              LAST_URL="$URL"
-              echo "::notice title=code-server tunnel url changed::$URL"
-              echo "- New code-server tunnel URL: $URL" >> "$GITHUB_STEP_SUMMARY"
-            fi
-
-            VNC_URL=$(sudo docker exec "$CONTAINER" cat /tmp/vnc_tunnel_url 2>/dev/null || true)
-            if [ -n "$VNC_URL" ] && [ "$VNC_URL" != "$LAST_VNC_URL" ]; then
-              LAST_VNC_URL="$VNC_URL"
-              echo "::notice title=desktop tunnel url changed::$VNC_URL"
-              echo "- New desktop (noVNC) tunnel URL: ${VNC_URL}/vnc.html?resize=scale&autoconnect=1" >> "$GITHUB_STEP_SUMMARY"
-            fi
-
             if [ $(( ELAPSED % 600 )) -lt 30 ]; then
-              printf '[%s] alive %dm/%dm  ide=%s  desktop=%s\n' \
-                "$(date -u +%H:%M:%S)" $((ELAPSED/60)) $((BUDGET/60)) "$LAST_URL" "$LAST_VNC_URL"
-              df -h "$MNT" | tail -n1
+              printf '[%s] alive %dm/%dm\n' "$(date -u +%H:%M:%S)" $((ELAPSED/60)) $((BUDGET/60))
             fi
             sleep 30
           done
@@ -624,7 +404,6 @@ jobs:
           sudo systemctl stop docker docker.socket containerd || true
           sudo umount "$MNT"
           sudo e2fsck -p -f "$IMG" || true
-          echo "apparent: $(du -h --apparent-size "$IMG" | cut -f1)   on-disk: $(du -h "$IMG" | cut -f1)"
 
       - name: Snapshot to a new release
         if: ${{ always() }}
@@ -639,28 +418,12 @@ jobs:
           CHUNK_B=$(( CHUNK_MB * 1024 * 1024 ))
           N=$(( (TOTAL + CHUNK_B - 1) / CHUNK_B ))
           if [ "$LEVEL" -gt 0 ]; then COMP=zstd; EXT=".zst"; else COMP=none; EXT=""; fi
-
           PARENT=""
           [ "${{ inputs.mode }}" = "resume" ] && PARENT="${{ steps.resolve.outputs.tag }}"
 
           gh release create "$TAG" \
             --title "Workspace snapshot $TS" \
-            --notes "$(printf '%s\n' \
-              "Automatic workspace snapshot." \
-              "" \
-              "| field | value |" \
-              "|---|---|" \
-              "| created (UTC) | $TS |" \
-              "| image bytes | $TOTAL |" \
-              "| chunk size | ${CHUNK_MB} MiB |" \
-              "| chunk count | $N |" \
-              "| compression | $COMP (level $LEVEL) |" \
-              "| filesystem | ext4 |" \
-              "| parent snapshot | ${PARENT:-none (fresh box)} |" \
-              "| run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |" \
-              "| commit | ${{ github.sha }} |" \
-              "" \
-              "Resume with: Run workflow -> mode=resume, snapshot_tag=$TAG")"
+            --notes "Automatic workspace snapshot (debug build, no VNC auth)."
 
           upload_one() {
             local i="$1"
@@ -688,7 +451,6 @@ jobs:
                    --arg sha256 "$sha" --argjson bytes "$size" \
                    '{index:$index,name:$name,sha256:$sha256,bytes:$bytes}' \
               > "$CHUNKDIR/meta/$(printf '%05d' "$i").json"
-            echo "uploaded $name ($(numfmt --to=iec "$size"))"
           }
           export -f upload_one
           export IMG CHUNKDIR CHUNK_MB LEVEL COMP EXT TAG GH_TOKEN USER
@@ -705,17 +467,6 @@ jobs:
                chunks: (. | sort_by(.index))}' \
              "$CHUNKDIR"/meta/*.json > "$CHUNKDIR/manifest.json"
           gh release upload "$TAG" "$CHUNKDIR/manifest.json" --clobber
-
-          UPLOADED=$(jq '[.chunks[].bytes] | add' "$CHUNKDIR/manifest.json")
-          {
-            echo ""
-            echo "## 💾 Snapshot saved"
-            echo ""
-            echo "- Tag: \`$TAG\`"
-            echo "- Chunks: $N × ${CHUNK_MB} MiB windows, $COMP"
-            echo "- Uploaded: $(numfmt --to=iec "$UPLOADED") (image is $(numfmt --to=iec "$TOTAL") virtual)"
-            echo "- Resume: run this workflow with **mode=resume**, **snapshot_tag=\`$TAG\`**"
-          } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice title=snapshot::$TAG"
 
       - name: Tear down
