@@ -440,8 +440,7 @@ jobs:
               su - "$DUSER" -c "Xvnc :1 \
                 -geometry 1920x1080 -depth 24 \
                 -rfbport $VNC_PORT -localhost \
-                -rfbauth $VNC_PW_FILE \
-                -SecurityTypes VncAuth \
+                -SecurityTypes None \
                 -AlwaysShared -AcceptSetDesktopSize \
                 -desktop devbox" >>/var/log/xvnc.log 2>&1
               CODE=$?
