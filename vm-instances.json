@@ -1,4 +1,13 @@
 {
   "version": 1,
-  "instances": []
+  "instances": [
+    {
+      "id": "d4137f02-5db6-4796-8d17-6a7c291ef6eb",
+      "name": "Trial Computer",
+      "description": "my first pc on this app",
+      "createdAt": "2026-09-19T07:14:41.530Z",
+      "snapshots": [],
+      "runs": []
+    }
+  ]
 }
