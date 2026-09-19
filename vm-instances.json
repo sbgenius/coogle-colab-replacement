@@ -6,7 +6,16 @@
       "name": "Trial Computer",
       "description": "my first pc on this app",
       "createdAt": "2026-09-19T07:14:41.530Z",
-      "snapshots": [],
+      "snapshots": [
+        {
+          "tag": "snap-20260919T072211Z-35428816352",
+          "createdAt": "2026-09-19T07:23:39.584Z",
+          "description": "",
+          "parent": null,
+          "runId": 35428816352,
+          "runUrl": "https://github.com/sbgenius/coogle-colab-replacement/actions/runs/35428816352"
+        }
+      ],
       "runs": [
         {
           "runId": 35428816352,
@@ -15,13 +24,13 @@
           "mode": "new",
           "snapshotTagUsed": null,
           "startedAt": "2026-09-19T07:15:17Z",
-          "status": "in_progress",
-          "conclusion": null,
-          "codeServerUrl": null,
-          "codeServerPassword": null,
-          "desktopUrl": null,
-          "resultingSnapshotTag": null,
-          "annotationDebug": "workspace: 0 annotation(s)"
+          "status": "completed",
+          "conclusion": "cancelled",
+          "codeServerUrl": "https://july-larger-llc-gray.trycloudflare.com",
+          "codeServerPassword": "UuRdPNtn0sSvgHsAcXsm",
+          "desktopUrl": "https://brown-discounts-archive-restrict.trycloudflare.com/vnc.html?resize=scale&autoconnect=1",
+          "resultingSnapshotTag": "snap-20260919T072211Z-35428816352",
+          "annotationDebug": "workspace: 8 annotation(s)"
         },
         {
           "runId": 35429191056,
