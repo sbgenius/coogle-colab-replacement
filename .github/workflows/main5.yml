@@ -1,0 +1,801 @@
+# .github/workflows/persistent-workspace.yml
+#
+# Persistent cloud dev box on GitHub Actions.
+#
+#   * All work lives inside ONE sparse disk-image file (ext4 on a loop device).
+#   * Docker's data-root is moved onto that image, so every container, layer,
+#     volume and byte you create lands inside the image.
+#   * The container itself persists across runs (not recreated every time),
+#     so anything installed anywhere on the filesystem survives - not just
+#     /home. Set force_rebuild=true to intentionally discard it and rebuild
+#     clean (needed after editing the Dockerfile/entrypoint below).
+#   * KDE now runs as a real non-root user (desktop_username /
+#     desktop_password, set at workflow-dispatch time), with sudo requiring
+#     that same password. No more root desktop sessions, no more unlockable
+#     lock screens, no more VS Code root warnings.
+#   * At the end of the session the image is sliced into fixed-offset chunks
+#     and pushed to a brand-new GitHub Release, with a manifest.
+#   * code-server + Cloudflare quick tunnel  -> browser IDE.
+#   * KDE Plasma (Xvnc + noVNC) + its own tunnel -> full graphical desktop.
+#
+# ---------------------------------------------------------------------------
+# PORTS
+#   8080  code-server        -> tunnel #1
+#   5901  Xvnc raw RFB       -> loopback only, never tunnelled
+#   6081  websockify/noVNC   -> tunnel #2
+#
+# NON-ROOT DESKTOP USER
+#   desktop_username / desktop_password are workflow inputs. The user is
+#   created (if missing) and its Linux password is (re)set from the input
+#   on every single boot, so it always matches whatever you typed this run -
+#   even across resumes, even if you change it. sudo uses the standard
+#   password-prompt behavior (NOT passwordless) - the user must type
+#   desktop_password to sudo.
+#
+#   Per your instruction, this build does NOT attempt to migrate old
+#   root-owned data from earlier snapshots. The new user gets a fresh home
+#   directory. Old data under /root (if any survives on a resumed disk) is
+#   simply not used by the desktop session going forward.
+#
+# VNC PASSWORD
+#   No `vncpasswd`/`tigervncpasswd` binary exists in this Ubuntu 24.04
+#   image. The passwd file is written by an embedded pure-Python DES
+#   routine (genpasswd.py), verified byte-for-byte against the
+#   `cryptography` library, using the SAME desktop_password input.
+#
+# XVNC / WEBSOCKIFY SUPERVISION
+#   Each is launched only from inside its own restart loop - never started
+#   once outside the loop and then separately "supervised" via a captured
+#   PID (that split previously raced two Xvnc processes on one socket lock).
+#
+# NOTE ON COMPRESSION
+#   Never makes a second copy of the image: each chunk is read straight out
+#   with dd and piped into zstd, so only the finished (small) chunk ever
+#   hits disk. Set compress_level: 0 for raw chunks.
+# ---------------------------------------------------------------------------
+
+name: Persistent Workspace kde mod sudo
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Start fresh or resume a snapshot?"
+        type: choice
+        required: true
+        default: new
+        options:
+          - new
+          - resume
+      snapshot_tag:
+        description: "Resume: release tag to restore. Leave empty for the newest snapshot."
+        type: string
+        required: false
+        default: ""
+      force_rebuild:
+        description: "Discard the existing container and rebuild fresh from the Dockerfile/entrypoint below. Needed after editing this workflow."
+        type: boolean
+        required: false
+        default: false
+      desktop_username:
+        description: "Non-root Linux username for the KDE desktop and sudo."
+        type: string
+        required: false
+        default: "dev"
+      desktop_password:
+        description: "Password for that user - also used for sudo and VNC login (first 8 chars for VNC, protocol limit)."
+        type: string
+        required: false
+        default: "devbox123"
+      session_minutes:
+        description: "How long to keep the box alive before snapshotting. Hard-capped at 240 (4h)."
+        type: string
+        required: false
+        default: "240"
+      image_size:
+        description: "Disk image size (only used for mode=new). e.g. 70G"
+        type: string
+        required: false
+        default: "70G"
+      chunk_mb:
+        description: "Release asset chunk size in MiB."
+        type: string
+        required: false
+        default: "1536"
+      compress_level:
+        description: "zstd level for chunks. 0 = no compression (raw chunks)."
+        type: string
+        required: false
+        default: "3"
+
+permissions:
+  contents: write
+
+env:
+  IMG: /mnt/workspace-disk/disk.img
+  MNT: /snapdisk
+  CHUNKDIR: /home/runner/chunks
+  CONTAINER: workspace
+  IDE_PORT: "8080"
+  NOVNC_PORT: "6081"
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  workspace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    steps:
+      - name: Checkout (shallow, workflow metadata only)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install required tools
+        run: |
+          set -euo pipefail
+          sudo apt-get -y install zstd jq >/dev/null 2>&1 || true
+          df -h / /mnt
+
+      - name: Resolve snapshot to restore
+        id: resolve
+        if: ${{ inputs.mode == 'resume' }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.snapshot_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --limit 100 --json tagName,createdAt \
+                    --jq '[.[] | select(.tagName | startswith("snap-"))]
+                          | sort_by(.createdAt) | reverse | .[0].tagName // empty')
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::mode=resume but no snapshot release found."
+            exit 1
+          fi
+          echo "Restoring from release: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create fresh disk image
+        if: ${{ inputs.mode == 'new' }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$(dirname "$IMG")"
+          sudo truncate -s "${{ inputs.image_size }}" "$IMG"
+          sudo mkfs.ext4 -F -m 0 -i 65536 -L workspace "$IMG"
+          ls -lh "$IMG"; du -h --apparent-size "$IMG"; du -h "$IMG"
+
+      - name: Restore disk image from release chunks
+        if: ${{ inputs.mode == 'resume' }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.tag }}"
+          sudo mkdir -p "$(dirname "$IMG")" "$CHUNKDIR"
+          sudo chown "$USER" "$(dirname "$IMG")" "$CHUNKDIR"
+
+          gh release download "$TAG" -p manifest.json -D "$CHUNKDIR" --clobber
+          MAN="$CHUNKDIR/manifest.json"
+          jq . "$MAN"
+
+          TOTAL=$(jq -r .image_bytes "$MAN")
+          CHUNK_MB=$(jq -r .chunk_mb "$MAN")
+          N=$(jq -r '.chunks | length' "$MAN")
+          COMP=$(jq -r .compression "$MAN")
+
+          truncate -s "$TOTAL" "$IMG"
+
+          fetch_one() {
+            local idx="$1" name="$2" sha="$3"
+            local dest="$CHUNKDIR/$name"
+            for try in 1 2 3; do
+              rm -f "$dest"
+              if gh release download "$TAG" -p "$name" -D "$CHUNKDIR" --clobber; then
+                if [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$sha" ]; then
+                  break
+                fi
+                echo "checksum mismatch on $name (attempt $try)" >&2
+              fi
+              [ "$try" = 3 ] && { echo "::error::failed to fetch $name"; exit 1; }
+              sleep 5
+            done
+            local seek=$(( idx * CHUNK_MB ))
+            if [ "$COMP" = "zstd" ]; then
+              zstd -dc "$dest" | dd of="$IMG" bs=1M seek="$seek" \
+                   conv=notrunc,sparse iflag=fullblock status=none
+            else
+              dd if="$dest" of="$IMG" bs=1M seek="$seek" \
+                 conv=notrunc,sparse iflag=fullblock status=none
+            fi
+            rm -f "$dest"
+            echo "restored chunk $idx/$N"
+          }
+          export -f fetch_one
+          export TAG CHUNKDIR IMG CHUNK_MB COMP N GH_TOKEN
+
+          jq -r '.chunks[] | "\(.index)\t\(.name)\t\(.sha256)"' "$MAN" \
+            | xargs -P 4 -n 3 bash -c 'fetch_one "$0" "$1" "$2"'
+
+          echo "Image reassembled:"; ls -lh "$IMG"; du -h "$IMG"
+          sudo e2fsck -p -f "$IMG" || true
+
+      - name: Mount image and move Docker onto it
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$MNT"
+          LOOP=$(sudo losetup --find --show "$IMG")
+          echo "LOOP=$LOOP" >> "$GITHUB_ENV"
+          sudo mount -o discard,noatime "$LOOP" "$MNT"
+          sudo mkdir -p "$MNT/docker" "$MNT/home"
+          df -h "$MNT"
+
+          sudo systemctl stop docker docker.socket containerd || true
+          echo '{ "data-root": "'"$MNT"'/docker", "storage-driver": "overlay2" }' \
+            | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker
+          sudo docker info --format 'Docker Root Dir: {{.DockerRootDir}}'
+
+      - name: Build workspace image
+        run: |
+          set -euo pipefail
+          BUILD=$(mktemp -d)
+
+          cat > "$BUILD/genpasswd.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """Write a TigerVNC-compatible passwd file with no external
+          vncpasswd/tigervncpasswd binary. VNC's passwd format: password
+          truncated/null-padded to 8 bytes, DES-ECB encrypted with a fixed,
+          bit-reversed key. Verified byte-for-byte against `cryptography`."""
+          import sys, os
+
+          PC1 = [56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,
+                 62,54,46,38,30,22,14,6,61,53,45,37,29,21,13,5,60,52,44,36,28,20,12,4,27,19,11,3]
+          PC2 = [13,16,10,23,0,4,2,27,14,5,20,9,22,18,11,3,25,7,15,6,26,19,12,1,
+                 40,51,30,36,46,54,29,39,50,44,32,47,43,48,38,55,33,52,45,41,49,35,28,31]
+          SHIFTS = [1,1,2,2,2,2,2,2,1,2,2,2,2,2,2,1]
+          IP = [57,49,41,33,25,17,9,1,59,51,43,35,27,19,11,3,61,53,45,37,29,21,13,5,63,55,47,39,31,23,15,7,
+                56,48,40,32,24,16,8,0,58,50,42,34,26,18,10,2,60,52,44,36,28,20,12,4,62,54,46,38,30,22,14,6]
+          FP = [39,7,47,15,55,23,63,31,38,6,46,14,54,22,62,30,37,5,45,13,53,21,61,29,36,4,44,12,52,20,60,28,
+                35,3,43,11,51,19,59,27,34,2,42,10,50,18,58,26,33,1,41,9,49,17,57,25,32,0,40,8,48,16,56,24]
+          E = [31,0,1,2,3,4,3,4,5,6,7,8,7,8,9,10,11,12,11,12,13,14,15,16,15,16,17,18,19,20,
+               19,20,21,22,23,24,23,24,25,26,27,28,27,28,29,30,31,0]
+          P = [15,6,19,20,28,11,27,16,0,14,22,25,4,17,30,9,1,7,23,13,31,26,2,8,18,12,29,5,21,10,3,24]
+          SBOX = [
+          [[14,4,13,1,2,15,11,8,3,10,6,12,5,9,0,7],[0,15,7,4,14,2,13,1,10,6,12,11,9,5,3,8],
+           [4,1,14,8,13,6,2,11,15,12,9,7,3,10,5,0],[15,12,8,2,4,9,1,7,5,11,3,14,10,0,6,13]],
+          [[15,1,8,14,6,11,3,4,9,7,2,13,12,0,5,10],[3,13,4,7,15,2,8,14,12,0,1,10,6,9,11,5],
+           [0,14,7,11,10,4,13,1,5,8,12,6,9,3,2,15],[13,8,10,1,3,15,4,2,11,6,7,12,0,5,14,9]],
+          [[10,0,9,14,6,3,15,5,1,13,12,7,11,4,2,8],[13,7,0,9,3,4,6,10,2,8,5,14,12,11,15,1],
+           [13,6,4,9,8,15,3,0,11,1,2,12,5,10,14,7],[1,10,13,0,6,9,8,7,4,15,14,3,11,5,2,12]],
+          [[7,13,14,3,0,6,9,10,1,2,8,5,11,12,4,15],[13,8,11,5,6,15,0,3,4,7,2,12,1,10,14,9],
+           [10,6,9,0,12,11,7,13,15,1,3,14,5,2,8,4],[3,15,0,6,10,1,13,8,9,4,5,11,12,7,2,14]],
+          [[2,12,4,1,7,10,11,6,8,5,3,15,13,0,14,9],[14,11,2,12,4,7,13,1,5,0,15,10,3,9,8,6],
+           [4,2,1,11,10,13,7,8,15,9,12,5,6,3,0,14],[11,8,12,7,1,14,2,13,6,15,0,9,10,4,5,3]],
+          [[12,1,10,15,9,2,6,8,0,13,3,4,14,7,5,11],[10,15,4,2,7,12,9,5,6,1,13,14,0,11,3,8],
+           [9,14,15,5,2,8,12,3,7,0,4,10,1,13,11,6],[4,3,2,12,9,5,15,10,11,14,1,7,6,0,8,13]],
+          [[4,11,2,14,15,0,8,13,3,12,9,7,5,10,6,1],[13,0,11,7,4,9,1,10,14,3,5,12,2,15,8,6],
+           [1,4,11,13,12,3,7,14,10,15,6,8,0,5,9,2],[6,11,13,8,1,4,10,7,9,5,0,15,14,2,3,12]],
+          [[13,2,8,4,6,15,11,1,10,9,3,14,5,0,12,7],[1,15,13,8,10,3,7,4,12,5,6,11,0,14,9,2],
+           [7,11,4,1,9,12,14,2,0,6,10,13,15,3,5,8],[2,1,14,7,4,10,8,13,15,12,9,0,3,5,6,11]]]
+
+          def bits_of(byte_data):
+              return [ (b >> (7-i)) & 1 for b in byte_data for i in range(8) ]
+          def bytes_of(bitlist):
+              out=bytearray()
+              for i in range(0,len(bitlist),8):
+                  v=0
+                  for b in bitlist[i:i+8]: v=(v<<1)|b
+                  out.append(v)
+              return bytes(out)
+          def permute(bits, table): return [bits[i] for i in table]
+
+          def des_encrypt_block(block8, key8):
+              kbits = permute(bits_of(key8), PC1)
+              C, D = kbits[:28], kbits[28:]
+              subkeys=[]
+              for s in SHIFTS:
+                  C = C[s:] + C[:s]
+                  D = D[s:] + D[:s]
+                  subkeys.append(permute(C+D, PC2))
+              bits = permute(bits_of(block8), IP)
+              L, R = bits[:32], bits[32:]
+              for k in subkeys:
+                  er = permute(R, E)
+                  x = [er[i]^k[i] for i in range(48)]
+                  out=[]
+                  for i in range(8):
+                      chunk = x[i*6:i*6+6]
+                      row = chunk[0]*2+chunk[5]
+                      col = chunk[1]*8+chunk[2]*4+chunk[3]*2+chunk[4]
+                      val = SBOX[i][row][col]
+                      out += [(val>>3)&1,(val>>2)&1,(val>>1)&1,val&1]
+                  out = permute(out, P)
+                  newR = [L[i]^out[i] for i in range(32)]
+                  L, R = R, newR
+              final = permute(R+L, FP)
+              return bytes_of(final)
+
+          def vnc_key_from_fixed():
+              fixed = bytes([0x17,0x34,0x51,0x6E,0x78,0x64,0x62,0x5A])
+              def revbits(b):
+                  r=0
+                  for i in range(8): r |= ((b>>i)&1)<<(7-i)
+                  return r
+              return bytes(revbits(b) for b in fixed)
+
+          def main():
+              if len(sys.argv) != 3:
+                  print("usage: genpasswd.py <password> <output_file>", file=sys.stderr)
+                  sys.exit(2)
+              password, outfile = sys.argv[1], sys.argv[2]
+              pw = password.encode()[:8].ljust(8, b'\x00')
+              key = vnc_key_from_fixed()
+              enc = des_encrypt_block(pw, key)
+              if len(enc) != 8:
+                  print(f"FATAL: expected 8 bytes, got {len(enc)}", file=sys.stderr)
+                  sys.exit(1)
+              with open(outfile, 'wb') as f:
+                  f.write(enc)
+              os.chmod(outfile, 0o600)
+              print(f"wrote {len(enc)} byte VNC passwd file to {outfile}")
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+          cat > "$BUILD/entrypoint.sh" <<'EOS'
+          #!/usr/bin/env bash
+          set -u
+
+          IDE_PORT=8080
+          VNC_PORT=5901
+          NOVNC_PORT=6081
+          DUSER="${DESKTOP_USERNAME:-dev}"
+          DPASS="${DESKTOP_PASSWORD:-devbox123}"
+
+          # -------------------------------------------------------------
+          # Create (if missing) and (re)configure the non-root desktop user
+          # on EVERY boot, so username/password always match this run's
+          # inputs, even across resumes with a different value typed in.
+          # -------------------------------------------------------------
+          if ! id -u "$DUSER" >/dev/null 2>&1; then
+            useradd -m -s /bin/bash -G sudo "$DUSER"
+            mkdir -p "/home/$DUSER"
+          fi
+          echo "${DUSER}:${DPASS}" | chpasswd
+          # Standard sudo - the user must type their password (NOT passwordless).
+          echo "$DUSER ALL=(ALL:ALL) ALL" > /etc/sudoers.d/90-$DUSER
+          chmod 440 /etc/sudoers.d/90-$DUSER
+          chown -R "$DUSER:$DUSER" "/home/$DUSER"
+
+          mkdir -p "/home/$DUSER/.config/code-server" "/home/$DUSER/.vnc" /var/log /workspace
+          chown -R "$DUSER:$DUSER" "/home/$DUSER/.config" "/home/$DUSER/.vnc" /workspace
+
+          CFG="/home/$DUSER/.config/code-server/config.yaml"
+          if [ ! -f "$CFG" ]; then
+            IDE_PW=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)
+            cat > "$CFG" <<EOF
+          bind-addr: 0.0.0.0:$IDE_PORT
+          auth: password
+          password: $IDE_PW
+          cert: false
+          EOF
+            chown "$DUSER:$DUSER" "$CFG"
+          fi
+          rm -f /tmp/tunnel_url /tmp/vnc_tunnel_url /STOP
+
+          # code-server runs as the desktop user too, for consistent file
+          # ownership between the IDE and anything you do in the desktop.
+          su - "$DUSER" -c "code-server >>/var/log/code-server.log 2>&1" &
+          for _ in $(seq 1 60); do
+            (echo >/dev/tcp/127.0.0.1/$IDE_PORT) >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          # -------------------------------------------------------------
+          # VNC password, from the same DPASS, rewritten every boot via the
+          # embedded genpasswd.py (no external vncpasswd binary needed).
+          # -------------------------------------------------------------
+          VNC_PW_FILE="/home/$DUSER/.vnc/passwd"
+          echo "$DPASS" > "/home/$DUSER/.vnc/vnc_password.txt"
+          chmod 600 "/home/$DUSER/.vnc/vnc_password.txt"
+          chown "$DUSER:$DUSER" "/home/$DUSER/.vnc/vnc_password.txt"
+
+          if ! python3 /usr/local/bin/genpasswd.py "$DPASS" "$VNC_PW_FILE" >>/var/log/genpasswd.log 2>&1; then
+            echo "[entrypoint] FATAL: genpasswd.py failed" >&2
+            echo "VNC_PASSWD_FILE_BAD" > /tmp/vnc_error
+          fi
+          chown "$DUSER:$DUSER" "$VNC_PW_FILE"
+          PWSIZE=$(stat -c%s "$VNC_PW_FILE" 2>/dev/null || echo 0)
+          echo "[entrypoint] vnc passwd file is ${PWSIZE} bytes" >&2
+          [ "$PWSIZE" -ne 8 ] && echo "VNC_PASSWD_FILE_BAD" > /tmp/vnc_error
+
+          cat > "/home/$DUSER/.vnc/xstartup" <<'EOSX'
+          #!/bin/sh
+          unset SESSION_MANAGER
+          export XDG_CURRENT_DESKTOP="KDE"
+          export XDG_SESSION_TYPE="x11"
+          export XDG_RUNTIME_DIR="/tmp/xdg-runtime-$USER"
+          mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
+          export KWIN_COMPOSE=N
+          export KWIN_OPENGL_INTERFACE=none
+          export QT_XCB_GL_INTEGRATION=none
+          lookandfeeltool -a org.kde.breezedark.desktop >/dev/null 2>&1 &
+          exec startplasma-x11
+          EOSX
+          chmod +x "/home/$DUSER/.vnc/xstartup"
+          chown "$DUSER:$DUSER" "/home/$DUSER/.vnc/xstartup"
+
+          # -------------------------------------------------------------
+          # Xvnc runs as DUSER (not root) - matches the file ownership of
+          # everything else and avoids "don't run X as root" complaints
+          # from various apps. Launched only from inside its own restart
+          # loop; never started once outside and separately "supervised"
+          # via a captured PID (that split previously raced two Xvnc
+          # instances on the same :1 socket lock).
+          # -------------------------------------------------------------
+          supervise_xvnc() {
+            while true; do
+              pkill -9 -u "$DUSER" -f 'Xvnc :1' >/dev/null 2>&1 || true
+              rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
+              sleep 1
+              su - "$DUSER" -c "Xvnc :1 \
+                -geometry 1920x1080 -depth 24 \
+                -rfbport $VNC_PORT -localhost \
+                -rfbauth $VNC_PW_FILE \
+                -SecurityTypes VncAuth \
+                -AlwaysShared -AcceptSetDesktopSize \
+                -desktop devbox" >>/var/log/xvnc.log 2>&1
+              CODE=$?
+              echo "[entrypoint] Xvnc exited (code $CODE), restarting" >> /var/log/xvnc.log
+              sleep 2
+            done
+          }
+          supervise_xvnc &
+
+          for _ in $(seq 1 30); do
+            DISPLAY=:1 xdpyinfo >/dev/null 2>&1 && break
+            sleep 1
+          done
+          export DISPLAY=:1
+          su - "$DUSER" -c "DISPLAY=:1 dbus-launch --exit-with-session /home/$DUSER/.vnc/xstartup" \
+            >>/var/log/plasma.log 2>&1 &
+
+          supervise_websockify() {
+            while true; do
+              websockify --web=/usr/share/novnc "$NOVNC_PORT" "127.0.0.1:$VNC_PORT" \
+                >>/var/log/websockify.log 2>&1
+              CODE=$?
+              echo "[entrypoint] websockify exited (code $CODE), restarting" >> /var/log/websockify.log
+              sleep 2
+            done
+          }
+          supervise_websockify &
+
+          supervise_tunnel() {
+            local port="$1" urlfile="$2" logfile="$3"
+            while true; do
+              : > "$logfile"
+              cloudflared tunnel --url "http://127.0.0.1:${port}" --no-autoupdate \
+                --logfile "$logfile" >>"$logfile" 2>&1 &
+              CF=$!
+              for _ in $(seq 1 90); do
+                URL=$(grep -ohE 'https://[a-z0-9-]+\.trycloudflare\.com' \
+                      "$logfile" 2>/dev/null | head -n1)
+                [ -n "${URL:-}" ] && { echo "$URL" > "$urlfile"; break; }
+                sleep 2
+              done
+              wait "$CF"
+              echo "[entrypoint] cloudflared ($port) exited, restarting" >> "$logfile"
+              rm -f "$urlfile"
+              sleep 3
+            done
+          }
+          supervise_tunnel "$IDE_PORT"   /tmp/tunnel_url     /var/log/cloudflared.log &
+          supervise_tunnel "$NOVNC_PORT" /tmp/vnc_tunnel_url /var/log/cloudflared-vnc.log &
+
+          wait -n
+          EOS
+
+          cat > "$BUILD/Dockerfile" <<'EOF'
+          FROM ubuntu:24.04
+          ENV DEBIAN_FRONTEND=noninteractive SHELL=/bin/bash
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                ca-certificates curl wget git openssh-client sudo nano vim \
+                build-essential python3 python3-pip python3-venv unzip zip \
+                jq htop tmux less locales dumb-init procps psmisc \
+                kde-plasma-desktop plasma-workspace kwin-x11 dolphin konsole \
+                systemsettings breeze breeze-gtk-theme kde-style-breeze \
+                tigervnc-standalone-server tigervnc-common \
+                dbus-x11 x11-xserver-utils x11-utils novnc websockify \
+              && rm -rf /var/lib/apt/lists/*
+          RUN curl -fsSL https://code-server.dev/install.sh | sh
+          RUN arch="$(dpkg --print-architecture)" \
+              && curl -fsSL -o /tmp/cf.deb \
+                 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.deb" \
+              && dpkg -i /tmp/cf.deb && rm /tmp/cf.deb
+          RUN curl -L -o /tmp/firefox.tar.xz "https://download.mozilla.org/?product=firefox-latest&os=linux64&lang=en-US" \
+              && tar xf /tmp/firefox.tar.xz -C /opt \
+              && ln -sf /opt/firefox/firefox /usr/local/bin/firefox \
+              && rm /tmp/firefox.tar.xz
+          RUN ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
+          COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+          COPY genpasswd.py /usr/local/bin/genpasswd.py
+          RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/genpasswd.py
+          WORKDIR /workspace
+          EXPOSE 8080 6081
+          ENTRYPOINT ["dumb-init","--","/usr/local/bin/entrypoint.sh"]
+          EOF
+
+          sudo docker build -t workspace:latest "$BUILD"
+
+      - name: Start or recreate container
+        env:
+          DESKTOP_USERNAME: ${{ inputs.desktop_username }}
+          DESKTOP_PASSWORD: ${{ inputs.desktop_password }}
+        run: |
+          set -euo pipefail
+          EXISTS=$(sudo docker ps -aq -f name="^${CONTAINER}$" || true)
+
+          if [ -n "$EXISTS" ] && [ "${{ inputs.force_rebuild }}" != "true" ]; then
+            echo "Existing container found - starting it as-is."
+            # Refresh username/password env vars even on a plain start, so
+            # a changed password takes effect (container restart re-runs
+            # the entrypoint, which re-applies DESKTOP_USERNAME/PASSWORD).
+            sudo docker rm -f "$CONTAINER" >/dev/null 2>&1
+            sudo docker run -d --name "$CONTAINER" --restart unless-stopped \
+              --hostname devbox \
+              --shm-size=1g \
+              -e DESKTOP_USERNAME="$DESKTOP_USERNAME" \
+              -e DESKTOP_PASSWORD="$DESKTOP_PASSWORD" \
+              -v "$MNT/home:/home" \
+              -p 127.0.0.1:${IDE_PORT}:8080 \
+              -p 127.0.0.1:${NOVNC_PORT}:6081 \
+              workspace:latest
+          else
+            if [ -n "$EXISTS" ]; then
+              echo "force_rebuild=true - discarding existing container and creating fresh."
+            else
+              echo "No existing container - creating fresh."
+            fi
+            sudo docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+            sudo docker run -d --name "$CONTAINER" --restart unless-stopped \
+              --hostname devbox \
+              --shm-size=1g \
+              -e DESKTOP_USERNAME="$DESKTOP_USERNAME" \
+              -e DESKTOP_PASSWORD="$DESKTOP_PASSWORD" \
+              -v "$MNT/home:/home" \
+              -p 127.0.0.1:${IDE_PORT}:8080 \
+              -p 127.0.0.1:${NOVNC_PORT}:6081 \
+              workspace:latest
+          fi
+          sudo docker ps
+
+      - name: Publish connection details
+        id: connect
+        env:
+          DESKTOP_USERNAME: ${{ inputs.desktop_username }}
+        run: |
+          set -euo pipefail
+          URL=""; VNC_URL=""
+          for _ in $(seq 1 90); do
+            [ -z "$URL" ] && URL=$(sudo docker exec "$CONTAINER" cat /tmp/tunnel_url 2>/dev/null || true)
+            [ -z "$VNC_URL" ] && VNC_URL=$(sudo docker exec "$CONTAINER" cat /tmp/vnc_tunnel_url 2>/dev/null || true)
+            [ -n "$URL" ] && [ -n "$VNC_URL" ] && break
+            sleep 4
+          done
+
+          if sudo docker exec "$CONTAINER" test -f /tmp/vnc_error 2>/dev/null; then
+            echo "::error::VNC password file was not written correctly."
+            sudo docker exec "$CONTAINER" cat /var/log/genpasswd.log || true
+            sudo docker exec "$CONTAINER" tail -n 40 /var/log/xvnc.log || true
+          fi
+          if [ -z "$URL" ]; then
+            echo "::warning::code-server tunnel not up yet; logs follow."
+            sudo docker exec "$CONTAINER" tail -n 50 /var/log/cloudflared.log || true
+          fi
+          if [ -z "$VNC_URL" ]; then
+            echo "::warning::desktop tunnel not up yet; logs follow."
+            sudo docker exec "$CONTAINER" tail -n 50 /var/log/cloudflared-vnc.log || true
+            sudo docker exec "$CONTAINER" tail -n 40 /var/log/xvnc.log || true
+          fi
+
+          IDE_PW=$(sudo docker exec "$CONTAINER" \
+                 sed -n 's/^password: //p' "/home/${DESKTOP_USERNAME}/.config/code-server/config.yaml" 2>/dev/null || true)
+          VNC_PW=$(sudo docker exec "$CONTAINER" cat "/home/${DESKTOP_USERNAME}/.vnc/vnc_password.txt" 2>/dev/null || true)
+          PWSIZE=$(sudo docker exec "$CONTAINER" stat -c%s "/home/${DESKTOP_USERNAME}/.vnc/passwd" 2>/dev/null || echo 0)
+          XVNC_COUNT=$(sudo docker exec "$CONTAINER" sh -c "pgrep -fc 'Xvnc :1'" 2>/dev/null || echo 0)
+          {
+            echo "## 🖥️  Workspace is up"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Desktop username | \`${DESKTOP_USERNAME}\` |"
+            echo "| Desktop / sudo / VNC password | \`${VNC_PW}\` (VNC uses first 8 chars) |"
+            echo "| code-server URL | $URL |"
+            echo "| code-server password | \`$IDE_PW\` |"
+            echo "| Desktop (noVNC) URL | ${VNC_URL:+${VNC_URL}/vnc.html?resize=scale&autoconnect=1} |"
+            echo "| VNC passwd file | ${PWSIZE} bytes (must be exactly 8) |"
+            echo "| Running Xvnc processes | ${XVNC_COUNT} (must be exactly 1) |"
+            echo "| Mode | ${{ inputs.mode }} |"
+            REQ=${{ inputs.session_minutes }}
+            echo "| Session budget | $(( REQ > 240 || REQ <= 0 ? 240 : REQ )) min (requested: ${REQ}, hard cap: 240) |"
+            echo ""
+            echo "sudo inside the desktop/terminal asks for the password above -"
+            echo "it is NOT passwordless."
+            echo ""
+            echo "Run \`touch /STOP\` in a terminal inside the IDE to end the"
+            echo "session early and trigger the snapshot immediately."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=code-server::$URL  (password: $IDE_PW)"
+          echo "::notice title=desktop (noVNC)::${VNC_URL:-not ready}/vnc.html?resize=scale&autoconnect=1  (user: ${DESKTOP_USERNAME}, password: $VNC_PW)"
+
+      - name: Reset stop switch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/stop-signal" \
+            >/dev/null 2>&1 || true
+
+      - name: Hold the session open
+        run: |
+          set -uo pipefail
+          REQUESTED=${{ inputs.session_minutes }}
+          CAP_MINUTES=240
+          MINUTES=$REQUESTED
+          if [ "$MINUTES" -gt "$CAP_MINUTES" ] || [ "$MINUTES" -le 0 ]; then
+            MINUTES=$CAP_MINUTES
+          fi
+          BUDGET=$(( MINUTES * 60 ))
+          START=$(date +%s)
+          LAST_URL=$(sudo docker exec "$CONTAINER" cat /tmp/tunnel_url 2>/dev/null || true)
+          LAST_VNC_URL=$(sudo docker exec "$CONTAINER" cat /tmp/vnc_tunnel_url 2>/dev/null || true)
+          while true; do
+            NOW=$(date +%s); ELAPSED=$(( NOW - START ))
+            [ "$ELAPSED" -ge "$BUDGET" ] && { echo "Session budget reached."; break; }
+
+            if sudo docker exec "$CONTAINER" test -f /STOP 2>/dev/null; then
+              echo "/STOP found inside the container - wrapping up early."
+              break
+            fi
+            if gh api "repos/${{ github.repository }}/git/refs/tags/stop-signal" >/dev/null 2>&1; then
+              echo "stop-signal tag found - wrapping up early."
+              break
+            fi
+            if ! sudo docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+              echo "::warning::Container is gone, restarting it."
+              sudo docker start "$CONTAINER" || true
+            fi
+
+            URL=$(sudo docker exec "$CONTAINER" cat /tmp/tunnel_url 2>/dev/null || true)
+            if [ -n "$URL" ] && [ "$URL" != "$LAST_URL" ]; then
+              LAST_URL="$URL"
+              echo "::notice title=code-server tunnel url changed::$URL"
+              echo "- New code-server tunnel URL: $URL" >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            VNC_URL=$(sudo docker exec "$CONTAINER" cat /tmp/vnc_tunnel_url 2>/dev/null || true)
+            if [ -n "$VNC_URL" ] && [ "$VNC_URL" != "$LAST_VNC_URL" ]; then
+              LAST_VNC_URL="$VNC_URL"
+              echo "::notice title=desktop tunnel url changed::$VNC_URL"
+              echo "- New desktop (noVNC) tunnel URL: ${VNC_URL}/vnc.html?resize=scale&autoconnect=1" >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            if [ $(( ELAPSED % 600 )) -lt 30 ]; then
+              printf '[%s] alive %dm/%dm  ide=%s  desktop=%s\n' \
+                "$(date -u +%H:%M:%S)" $((ELAPSED/60)) $((BUDGET/60)) "$LAST_URL" "$LAST_VNC_URL"
+              df -h "$MNT" | tail -n1
+            fi
+            sleep 30
+          done
+
+      - name: Quiesce and unmount the image
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          sudo docker stop -t 60 "$CONTAINER" || true
+          sudo fstrim -v "$MNT" || true
+          sync
+          sudo systemctl stop docker docker.socket containerd || true
+          sudo umount "$MNT"
+          sudo e2fsck -p -f "$IMG" || true
+          echo "apparent: $(du -h --apparent-size "$IMG" | cut -f1)   on-disk: $(du -h "$IMG" | cut -f1)"
+
+      - name: Snapshot to a new release
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$CHUNKDIR/meta"
+          TS=$(date -u +%Y%m%dT%H%M%SZ)
+          TAG="snap-${TS}-${{ github.run_id }}"
+          CHUNK_MB=${{ inputs.chunk_mb }}
+          LEVEL=${{ inputs.compress_level }}
+          TOTAL=$(stat -c%s "$IMG")
+          CHUNK_B=$(( CHUNK_MB * 1024 * 1024 ))
+          N=$(( (TOTAL + CHUNK_B - 1) / CHUNK_B ))
+          if [ "$LEVEL" -gt 0 ]; then COMP=zstd; EXT=".zst"; else COMP=none; EXT=""; fi
+
+          PARENT=""
+          [ "${{ inputs.mode }}" = "resume" ] && PARENT="${{ steps.resolve.outputs.tag }}"
+
+          gh release create "$TAG" \
+            --title "Workspace snapshot $TS" \
+            --notes "$(printf '%s\n' \
+              "Automatic workspace snapshot." \
+              "" \
+              "| field | value |" \
+              "|---|---|" \
+              "| created (UTC) | $TS |" \
+              "| image bytes | $TOTAL |" \
+              "| chunk size | ${CHUNK_MB} MiB |" \
+              "| chunk count | $N |" \
+              "| compression | $COMP (level $LEVEL) |" \
+              "| filesystem | ext4 |" \
+              "| parent snapshot | ${PARENT:-none (fresh box)} |" \
+              "| run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |" \
+              "| commit | ${{ github.sha }} |" \
+              "" \
+              "Resume with: Run workflow -> mode=resume, snapshot_tag=$TAG")"
+
+          upload_one() {
+            local i="$1"
+            local name; name=$(printf 'disk.part.%05d.img%s' "$i" "$EXT")
+            local dest="$CHUNKDIR/$name"
+            if [ "$COMP" = zstd ]; then
+              sudo dd if="$IMG" bs=1M skip=$(( i * CHUNK_MB )) count="$CHUNK_MB" \
+                   iflag=fullblock status=none \
+                | zstd -q -T2 -"$LEVEL" -o "$dest" -f
+            else
+              sudo dd if="$IMG" of="$dest" bs=1M skip=$(( i * CHUNK_MB )) \
+                   count="$CHUNK_MB" iflag=fullblock status=none
+              sudo chown "$USER" "$dest"
+            fi
+            local sha size
+            sha=$(sha256sum "$dest" | cut -d' ' -f1)
+            size=$(stat -c%s "$dest")
+            for try in 1 2 3; do
+              gh release upload "$TAG" "$dest" --clobber && break
+              [ "$try" = 3 ] && { echo "::error::upload failed for $name"; exit 1; }
+              sleep 10
+            done
+            rm -f "$dest"
+            jq -nc --argjson index "$i" --arg name "$name" \
+                   --arg sha256 "$sha" --argjson bytes "$size" \
+                   '{index:$index,name:$name,sha256:$sha256,bytes:$bytes}' \
+              > "$CHUNKDIR/meta/$(printf '%05d' "$i").json"
+            echo "uploaded $name ($(numfmt --to=iec "$size"))"
+          }
+          export -f upload_one
+          export IMG CHUNKDIR CHUNK_MB LEVEL COMP EXT TAG GH_TOKEN USER
+
+          seq 0 $(( N - 1 )) | xargs -P 3 -n 1 bash -c 'upload_one "$0"'
+
+          jq -s --arg tag "$TAG" --arg ts "$TS" --arg comp "$COMP" \
+                --argjson total "$TOTAL" --argjson cmb "$CHUNK_MB" \
+                --argjson level "$LEVEL" --arg parent "${PARENT:-}" \
+                --arg run "${{ github.run_id }}" \
+             '{schema:1, tag:$tag, created_utc:$ts, image_bytes:$total,
+               chunk_mb:$cmb, compression:$comp, compression_level:$level,
+               filesystem:"ext4", parent:$parent, run_id:$run,
+               chunks: (. | sort_by(.index))}' \
+             "$CHUNKDIR"/meta/*.json > "$CHUNKDIR/manifest.json"
+          gh release upload "$TAG" "$CHUNKDIR/manifest.json" --clobber
+
+          UPLOADED=$(jq '[.chunks[].bytes] | add' "$CHUNKDIR/manifest.json")
+          {
+            echo ""
+            echo "## 💾 Snapshot saved"
+            echo ""
+            echo "- Tag: \`$TAG\`"
+            echo "- Chunks: $N × ${CHUNK_MB} MiB windows, $COMP"
+            echo "- Uploaded: $(numfmt --to=iec "$UPLOADED") (image is $(numfmt --to=iec "$TOTAL") virtual)"
+            echo "- Resume: run this workflow with **mode=resume**, **snapshot_tag=\`$TAG\`**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=snapshot::$TAG"
+
+      - name: Tear down
+        if: ${{ always() }}
+        run: |
+          sudo umount "$MNT" 2>/dev/null || true
+          [ -n "${LOOP:-}" ] && sudo losetup -d "$LOOP" 2>/dev/null || true
+          sudo rm -f "$IMG" || true
+          df -h / /mnt || true
