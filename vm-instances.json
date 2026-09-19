@@ -20,7 +20,8 @@
           "codeServerUrl": null,
           "codeServerPassword": null,
           "desktopUrl": null,
-          "resultingSnapshotTag": null
+          "resultingSnapshotTag": null,
+          "annotationDebug": "workspace: 0 annotation(s)"
         }
       ]
     }
