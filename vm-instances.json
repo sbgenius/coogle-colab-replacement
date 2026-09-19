@@ -7,7 +7,22 @@
       "description": "my first pc on this app",
       "createdAt": "2026-09-19T07:14:41.530Z",
       "snapshots": [],
-      "runs": []
+      "runs": [
+        {
+          "runId": 35428816352,
+          "runUrl": "https://github.com/sbgenius/coogle-colab-replacement/actions/runs/35428816352",
+          "headSha": "d37676325ba4e6230a1d10aa6563f45c865af321",
+          "mode": "new",
+          "snapshotTagUsed": null,
+          "startedAt": "2026-09-19T07:15:17Z",
+          "status": "queued",
+          "conclusion": null,
+          "codeServerUrl": null,
+          "codeServerPassword": null,
+          "desktopUrl": null,
+          "resultingSnapshotTag": null
+        }
+      ]
     }
   ]
 }
